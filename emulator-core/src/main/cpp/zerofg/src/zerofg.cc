@@ -1,4 +1,5 @@
-﻿#include "zerofg/zerofg.h"
+#include "zerofg/zerofg.h"
+#include "vulkan_dispatch.h"
 
 #include <cmath>
 #include <utility>
@@ -9,6 +10,13 @@ class Interpolator::Impl {
  public:
   explicit Impl(const CreateInfo& create_info)
       : vulkan_(create_info.vulkan) {}
+
+  bool Initialize() {
+    return dispatch_.Load(
+        vulkan_.instance,
+        vulkan_.device,
+        vulkan_.get_instance_proc_addr);
+  }
 
   Status Resize(uint32_t width,
                 uint32_t height,
@@ -72,6 +80,7 @@ class Interpolator::Impl {
 
  private:
   VulkanContext vulkan_;
+  VulkanDispatch dispatch_;
 
   uint32_t width_ = 0;
   uint32_t height_ = 0;
@@ -85,8 +94,10 @@ class Interpolator::Impl {
 std::unique_ptr<Interpolator> Interpolator::Create(
     const CreateInfo& create_info,
     Status* status) {
-  if (create_info.vulkan.physical_device == VK_NULL_HANDLE ||
-      create_info.vulkan.device == VK_NULL_HANDLE) {
+  if (create_info.vulkan.instance == VK_NULL_HANDLE ||
+      create_info.vulkan.physical_device == VK_NULL_HANDLE ||
+      create_info.vulkan.device == VK_NULL_HANDLE ||
+      create_info.vulkan.get_instance_proc_addr == nullptr) {
     if (status) {
       *status = Status::kInvalidArgument;
     }
@@ -94,6 +105,14 @@ std::unique_ptr<Interpolator> Interpolator::Create(
   }
 
   auto impl = std::make_unique<Impl>(create_info);
+
+  if (!impl->Initialize()) {
+    if (status) {
+      *status = Status::kUnsupported;
+    }
+    return nullptr;
+  }
+
   auto interpolator =
       std::unique_ptr<Interpolator>(new Interpolator(std::move(impl)));
 

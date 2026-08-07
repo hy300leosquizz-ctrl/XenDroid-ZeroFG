@@ -1,4 +1,4 @@
-﻿add_library(zerofg STATIC
+add_library(zerofg STATIC
   src/zerofg.cc
 )
 

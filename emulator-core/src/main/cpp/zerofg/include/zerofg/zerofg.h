@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <cstdint>
 #include <memory>
@@ -28,8 +28,14 @@ enum class Status {
 };
 
 struct VulkanContext {
+  VkInstance instance = VK_NULL_HANDLE;
   VkPhysicalDevice physical_device = VK_NULL_HANDLE;
   VkDevice device = VK_NULL_HANDLE;
+
+  // ZeroFG resolves Vulkan entry points through the host loader so custom
+  // ICDs and drivers use exactly the same Vulkan dispatch path as the host.
+  PFN_vkGetInstanceProcAddr get_instance_proc_addr = nullptr;
+
   const VkAllocationCallbacks* allocator = nullptr;
 };
 
