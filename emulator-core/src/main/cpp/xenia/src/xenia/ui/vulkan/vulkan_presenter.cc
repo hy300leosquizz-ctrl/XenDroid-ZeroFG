@@ -11,6 +11,7 @@
 
 #include "zerofg/zerofg.h"
 
+
 #include <cstdint>
 
 #include "xenia/base/assert.h"
@@ -52,6 +53,12 @@ DEFINE_bool(
     "(3rd priority), which causes waiting for host display vertical sync, but "
     "may present with tearing if frames don't meet the host display refresh "
     "rate.",
+    "Vulkan");
+
+DEFINE_bool(
+    zerofg_frame_generation, false,
+    "Enable ZeroFG frame generation. When disabled, ZeroFG GPU resources "
+    "are not initialized and presentation follows the normal Vulkan path.",
     "Vulkan");
 #if XE_PLATFORM_MAC
 DEFINE_bool(vulkan_presenter_use_backing_scale, false,
@@ -2277,38 +2284,44 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
 }
 
 bool VulkanPresenter::InitializeSurfaceIndependent() {
+
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
-  // ZeroFG uses the exact Vulkan instance / loader path owned by Xenia.
-  const VulkanInstance* const vulkan_instance =
-      vulkan_device_->vulkan_instance();
-  const VulkanInstance::Functions& ifn = vulkan_instance->functions();
+  if (cvars::zerofg_frame_generation) {
+    // ZeroFG uses the exact Vulkan instance / loader path owned by Xenia.
+    const VulkanInstance* const vulkan_instance =
+        vulkan_device_->vulkan_instance();
+    const VulkanInstance::Functions& ifn =
+        vulkan_instance->functions();
 
-  zerofg::CreateInfo zerofg_create_info;
-  zerofg_create_info.vulkan.instance = vulkan_instance->instance();
-  zerofg_create_info.vulkan.physical_device =
-      vulkan_device_->physical_device();
-  zerofg_create_info.vulkan.device = device;
-  zerofg_create_info.vulkan.get_instance_proc_addr =
-      ifn.vkGetInstanceProcAddr;
-  zerofg_create_info.vulkan.allocator = nullptr;
-  zerofg_create_info.frame_context_count =
-      PaintContext::kSubmissionCount;
+    zerofg::CreateInfo zerofg_create_info;
+    zerofg_create_info.vulkan.instance =
+        vulkan_instance->instance();
+    zerofg_create_info.vulkan.physical_device =
+        vulkan_device_->physical_device();
+    zerofg_create_info.vulkan.device = device;
+    zerofg_create_info.vulkan.get_instance_proc_addr =
+        ifn.vkGetInstanceProcAddr;
+    zerofg_create_info.vulkan.allocator = nullptr;
+    zerofg_create_info.frame_context_count =
+        PaintContext::kSubmissionCount;
 
-  zerofg::Status zerofg_status = zerofg::Status::kSuccess;
-  zerofg_interpolator_ =
-      zerofg::Interpolator::Create(zerofg_create_info, &zerofg_status);
+    zerofg::Status zerofg_status = zerofg::Status::kSuccess;
+    zerofg_interpolator_ =
+        zerofg::Interpolator::Create(
+            zerofg_create_info, &zerofg_status);
 
-  if (zerofg_interpolator_) {
-    XELOGI(
-        "ZeroFG: interpolator initialized with {} frame contexts",
-        PaintContext::kSubmissionCount);
-  } else {
-    XELOGE(
-        "ZeroFG: interpolator initialization failed with status {} - "
-        "presentation will continue without ZeroFG",
-        static_cast<uint32_t>(zerofg_status));
+    if (zerofg_interpolator_) {
+      XELOGI(
+          "ZeroFG: interpolator initialized with {} frame contexts",
+          PaintContext::kSubmissionCount);
+    } else {
+      XELOGE(
+          "ZeroFG: interpolator initialization failed with status {} - "
+          "presentation will continue without ZeroFG",
+          static_cast<uint32_t>(zerofg_status));
+    }
   }
 
   VkDescriptorSetLayoutBinding guest_output_image_sampler_bindings[2];
