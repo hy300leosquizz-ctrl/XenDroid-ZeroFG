@@ -9,6 +9,8 @@
 
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 
+#include "zerofg/zerofg.h"
+
 #include <cstdint>
 
 #include "xenia/base/assert.h"
@@ -76,6 +78,21 @@ namespace shaders {
 #include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_sgsr_ps.h"
 #include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_triangle_strip_rect_vs.h"
 }  // namespace shaders
+
+VulkanPresenter::VulkanPresenter(
+    HostGpuLossCallback host_gpu_loss_callback,
+    VulkanDevice* vulkan_device,
+    const UISamplers* ui_samplers)
+    : Presenter(host_gpu_loss_callback),
+      vulkan_device_(vulkan_device),
+      ui_samplers_(ui_samplers),
+      guest_output_image_refresher_completion_timeline_(
+          vulkan_device, "guest-refresher"),
+      ui_completion_timeline_(vulkan_device, "ui"),
+      paint_context_(vulkan_device) {
+  assert_not_null(vulkan_device);
+  assert_not_null(ui_samplers);
+}
 
 VulkanPresenter::PaintContext::Submission::~Submission() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
@@ -155,6 +172,9 @@ VulkanPresenter::~VulkanPresenter() {
   // just one sleep will likely be needed.
   ui_completion_timeline_.AwaitAllSubmissions();
   guest_output_image_refresher_completion_timeline_.AwaitAllSubmissions();
+
+  // All work that could reference ZeroFG resources has completed.
+  zerofg_interpolator_.reset();
 
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
@@ -2259,6 +2279,37 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
 bool VulkanPresenter::InitializeSurfaceIndependent() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
+
+  // ZeroFG uses the exact Vulkan instance / loader path owned by Xenia.
+  const VulkanInstance* const vulkan_instance =
+      vulkan_device_->vulkan_instance();
+  const VulkanInstance::Functions& ifn = vulkan_instance->functions();
+
+  zerofg::CreateInfo zerofg_create_info;
+  zerofg_create_info.vulkan.instance = vulkan_instance->instance();
+  zerofg_create_info.vulkan.physical_device =
+      vulkan_device_->physical_device();
+  zerofg_create_info.vulkan.device = device;
+  zerofg_create_info.vulkan.get_instance_proc_addr =
+      ifn.vkGetInstanceProcAddr;
+  zerofg_create_info.vulkan.allocator = nullptr;
+  zerofg_create_info.frame_context_count =
+      PaintContext::kSubmissionCount;
+
+  zerofg::Status zerofg_status = zerofg::Status::kSuccess;
+  zerofg_interpolator_ =
+      zerofg::Interpolator::Create(zerofg_create_info, &zerofg_status);
+
+  if (zerofg_interpolator_) {
+    XELOGI(
+        "ZeroFG: interpolator initialized with {} frame contexts",
+        PaintContext::kSubmissionCount);
+  } else {
+    XELOGE(
+        "ZeroFG: interpolator initialization failed with status {} - "
+        "presentation will continue without ZeroFG",
+        static_cast<uint32_t>(zerofg_status));
+  }
 
   VkDescriptorSetLayoutBinding guest_output_image_sampler_bindings[2];
   guest_output_image_sampler_bindings[0].binding = 0;

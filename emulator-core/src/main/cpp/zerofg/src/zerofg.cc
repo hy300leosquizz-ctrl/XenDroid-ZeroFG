@@ -166,7 +166,7 @@ class Interpolator::Impl {
       return false;
     }
 
-    VkShaderModuleCreateInfo shader_info{}
+    VkShaderModuleCreateInfo shader_info{};
 
     VkShaderModuleCreateInfo motion_shader_info{};
     motion_shader_info.sType =
@@ -198,7 +198,6 @@ class Interpolator::Impl {
       return false;
     }
 
-;
     shader_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     shader_info.codeSize = shaders::kLumaSpvSize;
     shader_info.pCode = shaders::kLumaSpv;
@@ -781,6 +780,7 @@ class Interpolator::Impl {
         0,
         nullptr);
 
+    previous_luma_initialized_ = false;
     current_luma_initialized_ = false;
 
     motion_initialized_ = false;
@@ -1488,12 +1488,15 @@ class Interpolator::Impl {
   VkDescriptorPool luma_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet luma_descriptor_set_ = VK_NULL_HANDLE;
   VkDescriptorSet previous_luma_descriptor_set_ = VK_NULL_HANDLE;
+  bool previous_luma_initialized_ = false;
   bool current_luma_initialized_ = false;
 
   bool motion_initialized_ = false;
   bool synth_initialized_ = false;
   OwnedImage previous_luma_image_;
   OwnedImage current_luma_image_;
+  OwnedImage motion_image_;
+  OwnedImage synth_image_;
 
   uint32_t width_ = 0;
   uint32_t height_ = 0;

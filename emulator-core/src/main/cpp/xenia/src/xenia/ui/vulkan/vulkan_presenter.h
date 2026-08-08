@@ -26,6 +26,10 @@
 #include "xenia/ui/vulkan/vulkan_gpu_completion_timeline.h"
 #include "xenia/ui/vulkan/vulkan_instance.h"
 
+namespace zerofg {
+class Interpolator;
+}
+
 namespace xe {
 namespace ui {
 namespace vulkan {
@@ -448,19 +452,10 @@ class VulkanPresenter final : public Presenter {
     std::vector<VkSemaphore> swapchain_image_present_semaphores;
   };
 
-  explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
-                           VulkanDevice* vulkan_device,
-                           const UISamplers* ui_samplers)
-      : Presenter(host_gpu_loss_callback),
-        vulkan_device_(vulkan_device),
-        ui_samplers_(ui_samplers),
-        guest_output_image_refresher_completion_timeline_(vulkan_device,
-                                                          "guest-refresher"),
-        ui_completion_timeline_(vulkan_device, "ui"),
-        paint_context_(vulkan_device) {
-    assert_not_null(vulkan_device);
-    assert_not_null(ui_samplers);
-  }
+  explicit VulkanPresenter(
+      HostGpuLossCallback host_gpu_loss_callback,
+      VulkanDevice* vulkan_device,
+      const UISamplers* ui_samplers);
 
   bool InitializeSurfaceIndependent();
 
@@ -469,6 +464,9 @@ class VulkanPresenter final : public Presenter {
 
   VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
+
+  // ZeroFG interpolation engine. It does not own the queue or presentation.
+  std::unique_ptr<zerofg::Interpolator> zerofg_interpolator_;
 
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage
