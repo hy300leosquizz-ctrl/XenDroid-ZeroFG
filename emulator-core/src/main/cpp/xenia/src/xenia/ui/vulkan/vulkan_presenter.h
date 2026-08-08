@@ -496,6 +496,21 @@ class VulkanPresenter final : public Presenter {
   bool zerofg_runtime_failed_ = false;
   bool zerofg_first_interpolation_logged_ = false;
 
+  // Temporary cadence diagnostics for bringing up true 2x presentation.
+  uint64_t zerofg_cadence_paint_count_ = 0;
+  uint64_t zerofg_cadence_new_real_count_ = 0;
+  uint64_t zerofg_cadence_repeat_real_count_ = 0;
+  uint64_t zerofg_cadence_synth_count_ = 0;
+  uint64_t zerofg_cadence_secondary_real_count_ = 0;
+  uint64_t zerofg_cadence_secondary_drop_count_ = 0;
+  VkImage zerofg_cadence_last_real_image_ = VK_NULL_HANDLE;
+
+  // When S(A,B) has been presented, B is retained here for an immediate
+  // second paint/present without consuming a newer mailbox image C.
+  std::shared_ptr<GuestOutputImage> zerofg_pending_real_image_;
+  GuestOutputProperties zerofg_pending_real_properties_;
+  GuestOutputPaintConfig zerofg_pending_real_paint_config_;
+
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage
   // completion).

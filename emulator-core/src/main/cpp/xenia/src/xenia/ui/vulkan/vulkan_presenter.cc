@@ -1335,7 +1335,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // interfering with GPU command processing, and also to allow tearing so
   // variable refresh rate may be used where it's available.
   // Note: If the priorities here are changes, update the cvar descriptions.
-  if (cvars::vulkan_allow_present_mode_immediate &&
+  // ZeroFG bring-up requires deterministic FIFO ordering so the synthetic
+  // midpoint cannot be silently replaced by the following real frame in
+  // Mailbox or Immediate presentation.
+  if (cvars::zerofg_frame_generation) {
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+  } else if (cvars::vulkan_allow_present_mode_immediate &&
       std::find(present_modes.cbegin(), present_modes.cend(),
                 VK_PRESENT_MODE_IMMEDIATE_KHR) != present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
@@ -1640,7 +1645,22 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
   GuestOutputProperties guest_output_properties;
   GuestOutputPaintConfig guest_output_paint_config;
   std::shared_ptr<GuestOutputImage> guest_output_image;
-  {
+
+  bool zerofg_pending_real_paint = false;
+  bool zerofg_schedule_real_after_present = false;
+
+  if (zerofg_interpolator_ && zerofg_pending_real_image_) {
+    // This is the second half of S -> B. Do not touch the mailbox here:
+    // a newer real frame C may already be waiting there.
+    guest_output_image = zerofg_pending_real_image_;
+    zerofg_pending_real_image_.reset();
+
+    guest_output_properties = zerofg_pending_real_properties_;
+    guest_output_paint_config = zerofg_pending_real_paint_config_;
+
+    zerofg_pending_real_paint = true;
+    ++zerofg_cadence_secondary_real_count_;
+  } else {
     uint32_t guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(
         ConsumeGuestOutput(guest_output_mailbox_index, &guest_output_properties,
@@ -1657,6 +1677,39 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     // multiple threads can't paint the main target at the same time).
   }
 
+  if (zerofg_interpolator_ && guest_output_image) {
+    ++zerofg_cadence_paint_count_;
+
+    if (!zerofg_pending_real_paint) {
+      const VkImage current_real_handle = guest_output_image->image();
+
+      if (current_real_handle != zerofg_cadence_last_real_image_) {
+        ++zerofg_cadence_new_real_count_;
+        zerofg_cadence_last_real_image_ = current_real_handle;
+      } else {
+        ++zerofg_cadence_repeat_real_count_;
+      }
+    }
+
+    if ((zerofg_cadence_paint_count_ % 120) == 0) {
+#if defined(__ANDROID__)
+      __android_log_print(
+          ANDROID_LOG_INFO,
+          "ZeroFG",
+          "CADENCE paints=%llu new_real=%llu repeats=%llu synth=%llu secondary=%llu drops=%llu fifo=%u",
+          static_cast<unsigned long long>(zerofg_cadence_paint_count_),
+          static_cast<unsigned long long>(zerofg_cadence_new_real_count_),
+          static_cast<unsigned long long>(zerofg_cadence_repeat_real_count_),
+          static_cast<unsigned long long>(zerofg_cadence_synth_count_),
+          static_cast<unsigned long long>(
+              zerofg_cadence_secondary_real_count_),
+          static_cast<unsigned long long>(
+              zerofg_cadence_secondary_drop_count_),
+          paint_context_.swapchain_is_fifo ? 1u : 0u);
+#endif
+    }
+  }
+
   // ZeroFG first functional interpolation.
   //
   // This smoke-test path still produces one host presentation per normal
@@ -1665,7 +1718,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
   //
   // A real A -> S -> B presentation cadence is a later step.
   if (zerofg_interpolator_ && !zerofg_runtime_failed_ &&
-      guest_output_image) {
+      guest_output_image && !zerofg_pending_real_paint) {
     const std::shared_ptr<GuestOutputImage> zerofg_current_real_image =
         guest_output_image;
     const VkExtent2D zerofg_current_extent =
@@ -1689,6 +1742,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
       }
 
       zerofg_previous_real_image_.reset();
+      zerofg_pending_real_image_.reset();
 
       for (size_t i = 0; i < zerofg_synthetic_images_.size(); ++i) {
         zerofg_synthetic_images_[i].reset();
@@ -1869,9 +1923,19 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
                   output_image);
 
           if (interpolate_status == zerofg::Status::kSuccess) {
+            ++zerofg_cadence_synth_count_;
+
             // From this point onward, let the existing presenter treat the
             // synthetic image exactly like a normal guest output image.
             guest_output_image = zerofg_synthetic_image;
+
+            // S is being painted by this submission. Retain the corresponding
+            // real B so it can be painted immediately afterwards without
+            // consuming a newer real C from the guest-output mailbox.
+            zerofg_pending_real_image_ = zerofg_current_real_image;
+            zerofg_pending_real_properties_ = guest_output_properties;
+            zerofg_pending_real_paint_config_ = guest_output_paint_config;
+            zerofg_schedule_real_after_present = true;
 
             if (!zerofg_first_interpolation_logged_) {
               zerofg_first_interpolation_logged_ = true;
@@ -2534,8 +2598,44 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
   }
   switch (present_result) {
     case VK_SUCCESS:
+      if (zerofg_schedule_real_after_present &&
+          zerofg_pending_real_image_) {
+        // This recursively enters only the Vulkan implementation, not the
+        // public Presenter lock. The pending-real branch above consumes B and
+        // cannot schedule another interpolation, so recursion depth is one.
+        PaintResult secondary_result = PaintAndPresentImpl(false);
+
+        if (secondary_result == PaintResult::kGpuLostResponsible ||
+            secondary_result ==
+                PaintResult::kNotPresentedConnectionOutdated) {
+          return secondary_result;
+        }
+
+        if (secondary_result != PaintResult::kPresented &&
+            secondary_result != PaintResult::kPresentedSuboptimal) {
+          zerofg_pending_real_image_.reset();
+          ++zerofg_cadence_secondary_drop_count_;
+        }
+      }
       return PaintResult::kPresented;
+
     case VK_SUBOPTIMAL_KHR:
+      if (zerofg_schedule_real_after_present &&
+          zerofg_pending_real_image_) {
+        PaintResult secondary_result = PaintAndPresentImpl(false);
+
+        if (secondary_result == PaintResult::kGpuLostResponsible ||
+            secondary_result ==
+                PaintResult::kNotPresentedConnectionOutdated) {
+          return secondary_result;
+        }
+
+        if (secondary_result != PaintResult::kPresented &&
+            secondary_result != PaintResult::kPresentedSuboptimal) {
+          zerofg_pending_real_image_.reset();
+          ++zerofg_cadence_secondary_drop_count_;
+        }
+      }
       return PaintResult::kPresentedSuboptimal;
     case VK_ERROR_DEVICE_LOST:
       XELOGE(
