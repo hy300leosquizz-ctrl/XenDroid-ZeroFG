@@ -1,0 +1,121 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D previous_color;
+layout(set = 0, binding = 1) uniform sampler2D current_color;
+
+layout(set = 0, binding = 2, rgba32f)
+uniform readonly image2D motion_image;
+
+layout(set = 0, binding = 3, rgba16f)
+uniform writeonly image2D synth_output;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 extent;
+    float phase;
+} pc;
+
+const int kBlockSize = 8;
+
+vec2 PixelToUv(vec2 pixel) {
+    return (pixel + vec2(0.5)) / vec2(pc.extent);
+}
+
+vec2 ClampUv(vec2 uv) {
+    vec2 half_texel =
+        vec2(0.5) / vec2(pc.extent);
+
+    return clamp(
+        uv,
+        half_texel,
+        vec2(1.0) - half_texel);
+}
+
+void main() {
+    ivec2 pixel =
+        ivec2(gl_GlobalInvocationID.xy);
+
+    if (pixel.x >= int(pc.extent.x) ||
+        pixel.y >= int(pc.extent.y)) {
+        return;
+    }
+
+    ivec2 block =
+        pixel / kBlockSize;
+
+    vec4 motion_data =
+        imageLoad(motion_image, block);
+
+    vec2 motion =
+        motion_data.xy;
+
+    float confidence =
+        clamp(motion_data.w, 0.0, 1.0);
+
+    float phase =
+        clamp(pc.phase, 0.0, 1.0);
+
+    vec2 p =
+        vec2(pixel);
+
+    // motion maps previous -> current.
+    //
+    // At intermediate phase:
+    // previous source = x - phase * motion
+    // current source  = x + (1-phase) * motion
+    vec2 previous_position =
+        p - motion * phase;
+
+    vec2 current_position =
+        p + motion * (1.0 - phase);
+
+    vec4 previous_warped =
+        texture(
+            previous_color,
+            ClampUv(
+                PixelToUv(previous_position)));
+
+    vec4 current_warped =
+        texture(
+            current_color,
+            ClampUv(
+                PixelToUv(current_position)));
+
+    vec4 warped =
+        mix(
+            previous_warped,
+            current_warped,
+            phase);
+
+    // Safe fallback for uncertain motion vectors.
+    vec2 original_uv =
+        ClampUv(PixelToUv(p));
+
+    vec4 previous_plain =
+        texture(
+            previous_color,
+            original_uv);
+
+    vec4 current_plain =
+        texture(
+            current_color,
+            original_uv);
+
+    vec4 fallback =
+        mix(
+            previous_plain,
+            current_plain,
+            phase);
+
+    vec4 result =
+        mix(
+            fallback,
+            warped,
+            confidence);
+
+    imageStore(
+        synth_output,
+        pixel,
+        result);
+}

@@ -44,6 +44,7 @@ struct VulkanDispatch {
   PFN_vkCmdPushConstants cmd_push_constants = nullptr;
   PFN_vkCmdDispatch cmd_dispatch = nullptr;
   PFN_vkCmdPipelineBarrier cmd_pipeline_barrier = nullptr;
+  PFN_vkCmdBlitImage cmd_blit_image = nullptr;
 
   bool Load(VkInstance instance,
             VkDevice device,
@@ -152,6 +153,9 @@ struct VulkanDispatch {
     ZEROFG_LOAD_DEVICE(cmd_pipeline_barrier,
                        PFN_vkCmdPipelineBarrier,
                        "vkCmdPipelineBarrier");
+    ZEROFG_LOAD_DEVICE(cmd_blit_image,
+                       PFN_vkCmdBlitImage,
+                       "vkCmdBlitImage");
 
 #undef ZEROFG_LOAD_DEVICE
 

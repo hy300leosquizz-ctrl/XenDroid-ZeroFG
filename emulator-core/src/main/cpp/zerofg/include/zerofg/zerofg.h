@@ -46,6 +46,7 @@ struct Image {
   VkFormat format = VK_FORMAT_UNDEFINED;
   uint32_t width = 0;
   uint32_t height = 0;
+  VkImageUsageFlags usage = 0;
 };
 
 struct CreateInfo {
@@ -79,6 +80,13 @@ class Interpolator {
   //   1.0 = current
   //
   // The initial implementation will target phase == 0.5.
+//
+// previous/current must have VK_IMAGE_USAGE_SAMPLED_BIT.
+// output must be a distinct image with
+// VK_IMAGE_USAGE_TRANSFER_DST_BIT.
+//
+// The command buffer must support VK_QUEUE_GRAPHICS_BIT because the
+// MVP output path uses vkCmdBlitImage for format conversion.
   Status Interpolate(VkCommandBuffer command_buffer,
                      const Image& previous,
                      const Image& current,
