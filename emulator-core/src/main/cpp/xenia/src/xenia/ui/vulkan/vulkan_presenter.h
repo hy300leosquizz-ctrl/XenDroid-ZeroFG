@@ -468,6 +468,34 @@ class VulkanPresenter final : public Presenter {
   // ZeroFG interpolation engine. It does not own the queue or presentation.
   std::unique_ptr<zerofg::Interpolator> zerofg_interpolator_;
 
+  // ZeroFG temporal state. The real previous/current frames and the synthetic
+  // output used by a paint submission must remain alive until that submission
+  // has completed on the GPU.
+  struct ZeroFGSubmissionRefs {
+    std::shared_ptr<GuestOutputImage> previous;
+    std::shared_ptr<GuestOutputImage> current;
+    std::shared_ptr<GuestOutputImage> output;
+  };
+
+  std::shared_ptr<GuestOutputImage> zerofg_previous_real_image_;
+
+  std::array<std::shared_ptr<GuestOutputImage>,
+             PaintContext::kSubmissionCount>
+      zerofg_synthetic_images_;
+
+  std::array<bool, PaintContext::kSubmissionCount>
+      zerofg_synthetic_layout_initialized_ = {};
+
+  std::array<ZeroFGSubmissionRefs, PaintContext::kSubmissionCount>
+      zerofg_submission_refs_;
+
+  uint32_t zerofg_width_ = 0;
+  uint32_t zerofg_height_ = 0;
+  VkFormat zerofg_format_ = VK_FORMAT_UNDEFINED;
+
+  bool zerofg_runtime_failed_ = false;
+  bool zerofg_first_interpolation_logged_ = false;
+
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage
   // completion).

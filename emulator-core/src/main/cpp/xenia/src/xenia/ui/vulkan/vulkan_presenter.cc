@@ -11,6 +11,10 @@
 
 #include "zerofg/zerofg.h"
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
 
 #include <cstdint>
 
@@ -181,6 +185,13 @@ VulkanPresenter::~VulkanPresenter() {
   guest_output_image_refresher_completion_timeline_.AwaitAllSubmissions();
 
   // All work that could reference ZeroFG resources has completed.
+  zerofg_previous_real_image_.reset();
+  for (ZeroFGSubmissionRefs& refs : zerofg_submission_refs_) {
+    refs = {};
+  }
+  for (std::shared_ptr<GuestOutputImage>& image : zerofg_synthetic_images_) {
+    image.reset();
+  }
   zerofg_interpolator_.reset();
 
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
@@ -1514,6 +1525,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
       *paint_context_.submissions[current_paint_submission_index %
                                   paint_submission_count];
 
+  const uint32_t zerofg_context_index =
+      uint32_t(current_paint_submission_index % paint_submission_count);
+
+  if (zerofg_interpolator_) {
+    // The corresponding paint submission has completed before this slot is
+    // reused, so references retained for its previous ZeroFG work can go.
+    zerofg_submission_refs_[zerofg_context_index] = {};
+  }
+
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
@@ -1635,6 +1655,271 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     // the consumer critical section now as everything here either will be using
     // the new reference or is exclusively owned by main target painting (and
     // multiple threads can't paint the main target at the same time).
+  }
+
+  // ZeroFG first functional interpolation.
+  //
+  // This smoke-test path still produces one host presentation per normal
+  // presenter invocation. Once two distinct real frames A and B are known,
+  // it generates the midpoint S(A,B) and presents S instead of B.
+  //
+  // A real A -> S -> B presentation cadence is a later step.
+  if (zerofg_interpolator_ && !zerofg_runtime_failed_ &&
+      guest_output_image) {
+    const std::shared_ptr<GuestOutputImage> zerofg_current_real_image =
+        guest_output_image;
+    const VkExtent2D zerofg_current_extent =
+        zerofg_current_real_image->extent();
+
+    const bool zerofg_resize_needed =
+        zerofg_width_ != zerofg_current_extent.width ||
+        zerofg_height_ != zerofg_current_extent.height ||
+        zerofg_format_ != kGuestOutputFormat;
+
+    if (zerofg_resize_needed) {
+      // Resize reallocates ZeroFG scratch resources for all frame contexts.
+      // If ZeroFG has already been used, ensure none of those resources are
+      // still referenced by an older paint submission.
+      if (zerofg_width_ || zerofg_height_) {
+        paint_context_.completion_timeline.AwaitAllSubmissions();
+      }
+
+      for (ZeroFGSubmissionRefs& refs : zerofg_submission_refs_) {
+        refs = {};
+      }
+
+      zerofg_previous_real_image_.reset();
+
+      for (size_t i = 0; i < zerofg_synthetic_images_.size(); ++i) {
+        zerofg_synthetic_images_[i].reset();
+        zerofg_synthetic_layout_initialized_[i] = false;
+      }
+
+      const zerofg::Status resize_status =
+          zerofg_interpolator_->Resize(
+              zerofg_current_extent.width,
+              zerofg_current_extent.height,
+              kGuestOutputFormat,
+              kGuestOutputFormat);
+
+      if (resize_status != zerofg::Status::kSuccess) {
+        XELOGE(
+            "ZeroFG: Resize failed with status {}; disabling frame "
+            "generation for this session",
+            static_cast<uint32_t>(resize_status));
+
+#if defined(__ANDROID__)
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            "ZeroFG",
+            "Resize failed status=%u; disabling for session",
+            static_cast<unsigned>(resize_status));
+#endif
+
+        zerofg_runtime_failed_ = true;
+      } else {
+        zerofg_width_ = zerofg_current_extent.width;
+        zerofg_height_ = zerofg_current_extent.height;
+        zerofg_format_ = kGuestOutputFormat;
+
+        XELOGI(
+            "ZeroFG: resized interpolation resources to {}x{} format {}",
+            zerofg_width_,
+            zerofg_height_,
+            static_cast<uint32_t>(zerofg_format_));
+      }
+    }
+
+    if (!zerofg_runtime_failed_) {
+      const std::shared_ptr<GuestOutputImage> zerofg_previous_real_image =
+          zerofg_previous_real_image_;
+
+      const bool zerofg_have_frame_pair =
+          zerofg_previous_real_image &&
+          zerofg_previous_real_image != zerofg_current_real_image &&
+          zerofg_previous_real_image->extent().width ==
+              zerofg_current_extent.width &&
+          zerofg_previous_real_image->extent().height ==
+              zerofg_current_extent.height;
+
+      if (zerofg_have_frame_pair) {
+        std::shared_ptr<GuestOutputImage>& zerofg_synthetic_image =
+            zerofg_synthetic_images_[zerofg_context_index];
+
+        if (!zerofg_synthetic_image ||
+            zerofg_synthetic_image->extent().width !=
+                zerofg_current_extent.width ||
+            zerofg_synthetic_image->extent().height !=
+                zerofg_current_extent.height) {
+          std::unique_ptr<GuestOutputImage> new_synthetic_image =
+              GuestOutputImage::Create(
+                  vulkan_device_,
+                  zerofg_current_extent.width,
+                  zerofg_current_extent.height);
+
+          if (!new_synthetic_image) {
+            XELOGE(
+                "ZeroFG: failed to allocate synthetic guest output image; "
+                "disabling frame generation for this session");
+
+#if defined(__ANDROID__)
+            __android_log_print(
+                ANDROID_LOG_ERROR,
+                "ZeroFG",
+                "Failed to allocate synthetic output image");
+#endif
+
+            zerofg_runtime_failed_ = true;
+          } else {
+            zerofg_synthetic_image =
+                std::shared_ptr<GuestOutputImage>(
+                    std::move(new_synthetic_image));
+            zerofg_synthetic_layout_initialized_[zerofg_context_index] =
+                false;
+          }
+        }
+
+        if (!zerofg_runtime_failed_) {
+          // GuestOutputImage starts in VK_IMAGE_LAYOUT_UNDEFINED. ZeroFG
+          // deliberately rejects undefined external layouts, so establish the
+          // normal presenter internal layout once before the image's first use.
+          if (!zerofg_synthetic_layout_initialized_
+                   [zerofg_context_index]) {
+            VkImageMemoryBarrier synthetic_initial_barrier{};
+            synthetic_initial_barrier.sType =
+                VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            synthetic_initial_barrier.srcAccessMask = 0;
+            synthetic_initial_barrier.dstAccessMask =
+                kGuestOutputInternalAccessMask;
+            synthetic_initial_barrier.oldLayout =
+                VK_IMAGE_LAYOUT_UNDEFINED;
+            synthetic_initial_barrier.newLayout =
+                kGuestOutputInternalLayout;
+            synthetic_initial_barrier.srcQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            synthetic_initial_barrier.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            synthetic_initial_barrier.image =
+                zerofg_synthetic_image->image();
+            synthetic_initial_barrier.subresourceRange.aspectMask =
+                VK_IMAGE_ASPECT_COLOR_BIT;
+            synthetic_initial_barrier.subresourceRange.baseMipLevel = 0;
+            synthetic_initial_barrier.subresourceRange.levelCount = 1;
+            synthetic_initial_barrier.subresourceRange.baseArrayLayer = 0;
+            synthetic_initial_barrier.subresourceRange.layerCount = 1;
+
+            dfn.vkCmdPipelineBarrier(
+                draw_command_buffer,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                kGuestOutputInternalStageMask,
+                0,
+                0,
+                nullptr,
+                0,
+                nullptr,
+                1,
+                &synthetic_initial_barrier);
+
+            zerofg_synthetic_layout_initialized_
+                [zerofg_context_index] = true;
+          }
+
+          constexpr VkImageUsageFlags kZeroFGGuestOutputUsage =
+              VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+              VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+              VK_IMAGE_USAGE_SAMPLED_BIT |
+              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+              VK_IMAGE_USAGE_STORAGE_BIT;
+
+          const auto make_zerofg_image =
+              [](const std::shared_ptr<GuestOutputImage>& image)
+                  -> zerofg::Image {
+            zerofg::Image result;
+            result.image = image->image();
+            result.view = image->view();
+            result.layout = kGuestOutputInternalLayout;
+            result.format = kGuestOutputFormat;
+            result.width = image->extent().width;
+            result.height = image->extent().height;
+            result.usage = kZeroFGGuestOutputUsage;
+            return result;
+          };
+
+          ZeroFGSubmissionRefs& submission_refs =
+              zerofg_submission_refs_[zerofg_context_index];
+
+          submission_refs.previous = zerofg_previous_real_image;
+          submission_refs.current = zerofg_current_real_image;
+          submission_refs.output = zerofg_synthetic_image;
+
+          const zerofg::Image previous_image =
+              make_zerofg_image(zerofg_previous_real_image);
+          const zerofg::Image current_image =
+              make_zerofg_image(zerofg_current_real_image);
+          const zerofg::Image output_image =
+              make_zerofg_image(zerofg_synthetic_image);
+
+          const zerofg::Status interpolate_status =
+              zerofg_interpolator_->Interpolate(
+                  draw_command_buffer,
+                  zerofg_context_index,
+                  previous_image,
+                  current_image,
+                  0.5f,
+                  output_image);
+
+          if (interpolate_status == zerofg::Status::kSuccess) {
+            // From this point onward, let the existing presenter treat the
+            // synthetic image exactly like a normal guest output image.
+            guest_output_image = zerofg_synthetic_image;
+
+            if (!zerofg_first_interpolation_logged_) {
+              zerofg_first_interpolation_logged_ = true;
+
+              XELOGI(
+                  "ZeroFG: first synthetic midpoint frame recorded "
+                  "successfully ({}x{}, context {})",
+                  zerofg_width_,
+                  zerofg_height_,
+                  zerofg_context_index);
+
+#if defined(__ANDROID__)
+              __android_log_print(
+                  ANDROID_LOG_INFO,
+                  "ZeroFG",
+                  "FIRST SYNTH SUCCESS %ux%u context=%u",
+                  zerofg_width_,
+                  zerofg_height_,
+                  zerofg_context_index);
+#endif
+            }
+          } else {
+            // Interpolate may already have recorded commands before a Vulkan
+            // failure. Keep all submission_refs alive until this paint slot is
+            // known to have completed, but fall back visually to real frame B.
+            XELOGE(
+                "ZeroFG: Interpolate failed with status {}; disabling frame "
+                "generation for this session",
+                static_cast<uint32_t>(interpolate_status));
+
+#if defined(__ANDROID__)
+            __android_log_print(
+                ANDROID_LOG_ERROR,
+                "ZeroFG",
+                "Interpolate failed status=%u context=%u",
+                static_cast<unsigned>(interpolate_status),
+                zerofg_context_index);
+#endif
+
+            zerofg_runtime_failed_ = true;
+          }
+        }
+      }
+
+      // Temporal history always advances using REAL frames only. Never feed a
+      // generated S back as the next previous frame.
+      zerofg_previous_real_image_ = zerofg_current_real_image;
+    }
   }
 
   if (guest_output_image) {
