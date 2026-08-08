@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include <vulkan/vulkan.h>
 
@@ -51,6 +52,10 @@ struct Image {
 
 struct CreateInfo {
   VulkanContext vulkan;
+
+  // Number of independent GPU resource contexts used for
+  // frames in flight.
+  uint32_t frame_context_count = 3;
 };
 
 class Interpolator {
@@ -87,7 +92,11 @@ class Interpolator {
 //
 // The command buffer must support VK_QUEUE_GRAPHICS_BIT because the
 // MVP output path uses vkCmdBlitImage for format conversion.
-  Status Interpolate(VkCommandBuffer command_buffer,
+  // frame_context_index selects an independent GPU resource context.
+// The caller must not reuse the same index until the GPU submission
+// containing the previous Interpolate call for that index has completed.
+Status Interpolate(VkCommandBuffer command_buffer,
+                     uint32_t frame_context_index,
                      const Image& previous,
                      const Image& current,
                      float phase,
@@ -96,9 +105,9 @@ class Interpolator {
  private:
   class Impl;
 
-  explicit Interpolator(std::unique_ptr<Impl> impl);
+  explicit Interpolator(std::vector<std::unique_ptr<Impl>> impls);
 
-  std::unique_ptr<Impl> impl_;
+  std::vector<std::unique_ptr<Impl>> impls_;
 };
 
 }  // namespace zerofg

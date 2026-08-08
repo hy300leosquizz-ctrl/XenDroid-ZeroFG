@@ -1517,17 +1517,35 @@ std::unique_ptr<Interpolator> Interpolator::Create(
     return nullptr;
   }
 
-  auto impl = std::make_unique<Impl>(create_info);
-
-  if (!impl->Initialize()) {
+  if (create_info.frame_context_count == 0 ||
+      create_info.frame_context_count > 8) {
     if (status) {
-      *status = Status::kUnsupported;
+      *status = Status::kInvalidArgument;
     }
     return nullptr;
   }
 
+  std::vector<std::unique_ptr<Impl>> impls;
+  impls.reserve(create_info.frame_context_count);
+
+  for (uint32_t i = 0;
+       i < create_info.frame_context_count;
+       ++i) {
+    auto impl = std::make_unique<Impl>(create_info);
+
+    if (!impl->Initialize()) {
+      if (status) {
+        *status = Status::kUnsupported;
+      }
+      return nullptr;
+    }
+
+    impls.push_back(std::move(impl));
+  }
+
   auto interpolator =
-      std::unique_ptr<Interpolator>(new Interpolator(std::move(impl)));
+      std::unique_ptr<Interpolator>(
+          new Interpolator(std::move(impls)));
 
   if (status) {
     *status = Status::kSuccess;
@@ -1536,8 +1554,9 @@ std::unique_ptr<Interpolator> Interpolator::Create(
   return interpolator;
 }
 
-Interpolator::Interpolator(std::unique_ptr<Impl> impl)
-    : impl_(std::move(impl)) {}
+Interpolator::Interpolator(
+    std::vector<std::unique_ptr<Impl>> impls)
+    : impls_(std::move(impls)) {}
 
 Interpolator::~Interpolator() = default;
 
@@ -1545,16 +1564,42 @@ Status Interpolator::Resize(uint32_t width,
                             uint32_t height,
                             VkFormat input_format,
                             VkFormat output_format) {
-  return impl_->Resize(width, height, input_format, output_format);
+  if (impls_.empty()) {
+    return Status::kInvalidArgument;
+  }
+
+  for (const auto& impl : impls_) {
+    const Status status =
+        impl->Resize(
+            width,
+            height,
+            input_format,
+            output_format);
+
+    if (status != Status::kSuccess) {
+      return status;
+    }
+  }
+
+  return Status::kSuccess;
 }
 
 Status Interpolator::Interpolate(VkCommandBuffer command_buffer,
+    uint32_t frame_context_index,
                                  const Image& previous,
                                  const Image& current,
                                  float phase,
                                  const Image& output) {
-  return impl_->Interpolate(
-      command_buffer, previous, current, phase, output);
+  if (frame_context_index >= impls_.size()) {
+    return Status::kInvalidArgument;
+  }
+
+  return impls_[frame_context_index]->Interpolate(
+      command_buffer,
+      previous,
+      current,
+      phase,
+      output);
 }
 
 }  // namespace zerofg
