@@ -54,3 +54,7 @@ I would like to take this opportunity to help a friend out. If you are willing t
 [Bitshifter's Kofi](https://ko-fi.com/bitsh1ft3r/goal?g=0). He's the maintainer of the [Xenon Project](https://github.com/xenon-emu/xenon)
 and every donation can help making a difference for the maintainer.
 Thank you - Fabxx
+
+NOTES FROM THE OWNER OF THIS FORK
+
+*** This is a fork of Xendroid to test the experimentol implementation of ZeroFG, an agnostic open source frame generation engine focused on mobile platforms.
