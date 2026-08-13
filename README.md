@@ -61,7 +61,11 @@ AI-generated analysis, designs, code suggestions, and documentation are treated 
 
 ## Project lineage and licensing
 
-XenDroid derives from Android Xbox 360 emulator work based on Xenia. Existing copyright notices, licenses, and third-party terms remain applicable in their respective files and directories. See the repository's license files and source headers for details. No new license or provenance claim is introduced by the ZeroFG presentation in this README.
+XenDroid derives from Android Xbox 360 emulator work based on Xenia. Existing copyright notices, licenses, and third-party terms remain applicable in their respective files and directories.
+
+The ZeroFG-specific engine code under `emulator-core/src/main/cpp/zerofg/` is licensed under the **Apache License, Version 2.0** (`Apache-2.0`); see [`emulator-core/src/main/cpp/zerofg/LICENSE`](emulator-core/src/main/cpp/zerofg/LICENSE).
+
+Xenia code retains its existing BSD 3-Clause license, and third-party components retain their respective licenses. The Apache-2.0 license applied to ZeroFG does not relicense XenDroid, Xenia, or unrelated third-party code.
 
 ## Disclaimer
 
