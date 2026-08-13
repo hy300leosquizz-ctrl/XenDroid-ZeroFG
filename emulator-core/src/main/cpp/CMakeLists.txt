@@ -39,6 +39,7 @@ target_sources(emu
         xe_android_disc_swap.cpp
         xe_android_hid.cpp
         xe_android_input_driver.cpp
+        xe_android_message_box.cpp
         xe_android_text_input.cpp
         xe_android_util.cpp
         xe_opensles_audio_driver.cpp

@@ -1,11 +1,8 @@
 package xendroid.compose.ui.disc
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -16,7 +13,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -25,18 +21,21 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import xendroid.compose.Emulator
+import xendroid.compose.ui.panel.GuestPanelOption
+import xendroid.compose.ui.panel.GuestPanelOptions
 
 /**
- * Answers a guest disc-swap prompt (XamSwapDisc).
- *
- * An in-window Surface, not a Dialog: a Dialog takes window focus and would trip
- * the host activity's focus-loss pause. A guest thread is blocked until answered,
- * so [onChoose]/[onCancel] must fire for every request. The guest ejects before
- * asking, so cancelling leaves the game with no disc.
+ * Answers a guest disc-swap prompt (XamSwapDisc). An in-window Surface, not a Dialog:
+ * a Dialog takes window focus and trips the host's focus-loss pause. A guest thread blocks
+ * until answered, so [onChoose]/[onCancel] must fire for every request. The guest ejects
+ * before asking, so cancelling leaves the game with no disc. [selected] is driven by the
+ * host because the D-pad arrives as hat axes that never reach a composable; Cancel is the
+ * LAST option, index discCount.
  */
 @Composable
 fun DiscSwapPanel(
     request: Emulator.DiscSwapRequest,
+    selected: Int,
     onChoose: (String) -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
@@ -97,29 +96,23 @@ fun DiscSwapPanel(
                             style = MaterialTheme.typography.bodyMedium,
                             modifier = Modifier.padding(top = if (compact) 8.dp else 16.dp),
                         )
-                    } else {
-                        for (i in 0 until count) {
-                            Text(
-                                labels[i],
-                                style = MaterialTheme.typography.bodyLarge,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .heightIn(min = 48.dp)
-                                    .clickable { onChoose(paths[i]) }
-                                    .padding(vertical = 12.dp),
-                            )
-                        }
                     }
                 }
 
-                // Pinned, so a long list cannot hide it.
-                Row(
-                    Modifier.fillMaxWidth().padding(top = if (compact) 4.dp else 12.dp),
-                    horizontalArrangement = Arrangement.End,
-                ) {
-                    TextButton(onClick = onCancel) { Text("Cancel") }
+                // Pinned, so a long list cannot hide Cancel.
+                GuestPanelOptions(Modifier.padding(top = if (compact) 8.dp else 16.dp)) {
+                    for (i in 0 until count) {
+                        GuestPanelOption(
+                            label = labels[i],
+                            selected = i == selected,
+                            onClick = { onChoose(paths[i]) },
+                        )
+                    }
+                    GuestPanelOption(
+                        label = "Cancel",
+                        selected = selected == count,
+                        onClick = onCancel,
+                    )
                 }
             }
         }

@@ -51,6 +51,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import kotlin.math.roundToInt
@@ -60,6 +61,8 @@ import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.viewinterop.AndroidView
 import xendroid.compose.ui.disc.DiscSwapPanel
 import xendroid.compose.ui.keyboard.GuestKeyboardPanel
+import xendroid.compose.ui.keyboard.clampToUtf16Units
+import xendroid.compose.ui.messagebox.GuestMessageBoxPanel
 import xendroid.compose.ui.theme.xendroidTheme
 import xendroid.compose.gamepad.GamepadConfigDto
 import xendroid.compose.gamepad.GamepadController
@@ -71,24 +74,21 @@ import xendroid.compose.data.KeymapStore
 import xendroid.compose.settings.ConfigStore
 
 /**
- * The :emu emulator host (separate process; see manifest). Reads game_uri from the
- * Intent, performs the PRE-surface native setup, hosts a Vulkan SurfaceView, and drives
- * the EXACT surface->boot ordering (SP0 makes destroy/recreate safe). Hardware input
- * (controller + keyboard) only; the on-screen touch pad is SP4. onDestroy hard-kills
- * the process. Mirrors legacy xendroid.compose.EmulatorActivity.
+ * The :emu emulator host (separate process; see manifest). Reads game_uri from the Intent,
+ * performs the PRE-surface native setup, hosts a Vulkan SurfaceView, and drives the exact
+ * surface->boot ordering. onDestroy hard-kills the process.
  */
 class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     companion object {
         private const val TAG = "EmuHost"
         private const val KEYBOARD_POLL_MS = 150L
-        const val EXTRA_GAME_URI = "game_uri"   // matches GameLibraryViewModel.EXTRA_GAME_URI
-        // matches GameLibraryViewModel
+        const val EXTRA_GAME_URI = "game_uri"   // keys must match GameLibraryViewModel
         const val EXTRA_DISC_LABELS = "disc_labels"
         const val EXTRA_DISC_PATHS = "disc_paths"
 
-        // Default Android-KeyEvent -> VirtualControl KEY_CODE map (KeyMapConfig defaults).
-        // Mirrored locally: VirtualControl lives in :app, not on the :app-compose classpath.
+        // Default Android-KeyEvent -> VirtualControl KEY_CODE map, mirrored locally because
+        // VirtualControl lives in :app, not on the :app-compose classpath.
         private const val KC_DPAD_LEFT = 0;  private const val KC_DPAD_UP = 1
         private const val KC_DPAD_RIGHT = 2; private const val KC_DPAD_DOWN = 3
         private const val KC_A = 4; private const val KC_B = 5
@@ -101,51 +101,50 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         private const val KC_RTHUMB_LEFT = 20; private const val KC_RTHUMB_UP = 21
         private const val KC_RTHUMB_RIGHT = 22; private const val KC_RTHUMB_DOWN = 23
         private const val KEY_VALUE_UNUSED = -1
-        // Analog hardware never reports exactly 0; without this the drift
-        // crosses into native on every sample.
+        // Analog hardware never reports exactly 0; without this the drift crosses into
+        // native on every sample.
         private const val AXIS_DEADZONE = 0.08f
         private const val FOCUS_PAUSE_DEBOUNCE_MS = 250L
     }
 
     private val session = EmulatorSession()
     private var surfaceView: SurfaceView? = null
-    private var started = false          // surface-callback boot guard (mirrors legacy)
+    private var started = false          // surface-callback boot guard
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val pauseOnFocusLost = Runnable { if (session.booted) session.pause() }
 
-    // SP4 on-screen touch gamepad.
     private val gamepad by lazy { GamepadController(applicationContext) }
     private val brightnessSampler = ScreenBrightnessSampler()
-    @Volatile private var overlayWantsBrightness = false   // sampler should run while visible
+    @Volatile private var overlayWantsBrightness = false
     private var hapticsEnabled = false
-    private val bootedState = mutableStateOf(false)   // gates the overlay (post-boot only)
+    private val bootedState = mutableStateOf(false)
     private val showFpsOverlay = mutableStateOf(false) // Display|show_debug_overlay (native TOML config)
-    private val menuOpenState = mutableStateOf(false)  // in-game menu (back pauses + shows Quit)
+    private val menuOpenState = mutableStateOf(false)
     private val keyboardRequestState =
-        mutableStateOf<Emulator.KeyboardRequest?>(null) // guest text-entry prompt, if any
+        mutableStateOf<Emulator.KeyboardRequest?>(null)
     private val discRequestState =
-        mutableStateOf<Emulator.DiscSwapRequest?>(null) // guest disc-swap prompt, if any
+        mutableStateOf<Emulator.DiscSwapRequest?>(null)
+    private val messageBoxRequestState =
+        mutableStateOf<Emulator.MessageBoxRequest?>(null)
+    private val panelSelectedState = mutableIntStateOf(0)
+    private val keyboardTextState = mutableStateOf("")
 
-    // User hardware-key bindings (Android keycode -> game KEY_CODE), loaded from
-    // KeymapStore in onCreate; falls back to GameButtons.DEFAULT_LOOKUP until loaded.
+    // Falls back to GameButtons.DEFAULT_LOOKUP until KeymapStore loads in onCreate.
     @Volatile private var keyMap: Map<Int, Int> = GameButtons.DEFAULT_LOOKUP
     private var vibrator: Vibrator? = null
-    // Edge-detect state for analog triggers reported as axes (emit a digital press on threshold).
+    // Edge-detect state for analog triggers reported as axes.
     private var lTriggerDown = false
     private var rTriggerDown = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Immersive fullscreen: hide BOTH system bars. The legacy FLAG_FULLSCREEN
-        // only hid the status bar, leaving the nav buttons overlaid on the game.
         enterImmersiveMode()
 
-        // Tie this :emu process to the main process: keep the launcher out of the
-        // cached band (so lmkd stops reaping it mid-game) and notice if it dies anyway.
+        // Keep the launcher out of the cached band so lmkd stops reaping it mid-game, and
+        // notice if the main process dies anyway.
         EmuProcessLink.bindToMainProcess(this)
 
-        // In-app game_uri extra, or frontend shapes (AutoStartFile, data URI).
         val gameUri = FrontendLaunch.resolveGamePath(this, intent)
         if (gameUri.isNullOrEmpty()) {
             Log.e(TAG, "No bootable game in launch intent; finishing")
@@ -157,24 +156,20 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             finish(); return
         }
 
-        // Real-path (All Files Access) launch: the resolved gameUri is an ABSOLUTE
-        // host path (real-path is the only library mode).
-
-        // PRE-surface native setup is async ONLY to ensureLoaded() off-main on delay-load
-        // devices; the actual native setup_* calls are marshaled back to the main thread.
+        // Async ONLY so ensureLoaded() runs off-main on delay-load devices; the native
+        // setup_* calls are marshaled back to the main thread.
         lifecycleScope.launch {
             val store = KeymapStore(applicationContext)
             keyMap = withContext(Dispatchers.IO) {
                 EmulatorRuntime.ensureLoaded()            // idempotent; lazy on Adreno 5xx/6xx
                 store.androidToGameKey.firstOrNull() ?: GameButtons.DEFAULT_LOOKUP
             }
-            // FPS overlay gate: SP2 settings live in the native TOML Config (NOT
-            // SharedPreferences). Read the Display|show_debug_overlay boolean off-main
-            // via ConfigStore so the existing settings toggle drives overlay visibility.
+            // show_debug_overlay lives in the native TOML config, not SharedPreferences;
+            // read it off-main via ConfigStore.
             showFpsOverlay.value = withContext(Dispatchers.IO) { readShowDebugOverlay() }
 
-            // Guard on the LIVE All Files Access grant (revoked-in-Settings while away =>
-            // fail cleanly instead of booting against a path we can no longer read).
+            // Guard on the LIVE grant: revoked-in-Settings while away => fail cleanly
+            // instead of booting against a path we can no longer read.
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R ||
                 !Environment.isExternalStorageManager()) {
                 Toast.makeText(this@EmulatorHostActivity,
@@ -182,13 +177,13 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                     Toast.LENGTH_LONG).show()
                 finish(); return@launch
             }
-            // Shortcut launches skip the main process; make sure the session
-            // logcat capture exists. Shelving stays a main-process concern.
+            // Shortcut launches skip the main process; make sure the session logcat
+            // capture exists.
             withContext(Dispatchers.IO) {
                 runCatching { SessionLogs.ensureCaptureRunning() }
                     .onFailure { Log.w(TAG, "Session log capture failed", it) }
             }
-            prepareNativeRealPath(gameUri)                // back on main (lifecycleScope = Main)
+            prepareNativeRealPath(gameUri)                // back on main
             installSurfaceView()
         }
     }
@@ -205,10 +200,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
     }
 
-    /** Edge-to-edge immersive: hides the status AND navigation bars, with the
-     *  bars swipe-to-reveal transiently. */
     private fun enterImmersiveMode() {
-        // Gamepad play produces no touch events, so the display still times out.
+        // Gamepad play produces no touch events, so the display would still time out.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).apply {
@@ -218,10 +211,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
     }
 
-    /** Reads Display|show_debug_overlay from the live native TOML config (SP2 store, not
-     *  SharedPreferences). Uses a read-only string snapshot so closing the single-use
-     *  handle frees the native table WITHOUT re-serializing the file to disk (a plain
-     *  read must not mutate the config). Best-effort: any failure defaults the gate off. */
+    /** Uses a read-only string snapshot so closing the handle frees the native table WITHOUT
+     *  re-serializing to disk (a plain read must not mutate the config). Failure => off. */
     private fun readShowDebugOverlay(): Boolean = runCatching {
         val handle = ConfigStore(applicationContext).openLiveSnapshot()
         try {
@@ -231,10 +222,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
     }.getOrDefault(false)
 
-    /** Real-path (All Files Access) PRE-surface setup: setupContext -> setupGamePathReal
-     *  (String setup_game_path overload => native BOOT_TYPE_WITH_PATH / Emulator::LaunchPath,
-     *  mounting the right real-path device by extension) -> launch args -> uri info list.
-     *  [absPath] is an absolute host path. */
+    /** PRE-surface setup in order: setupContext -> setupGamePathReal -> launch args ->
+     *  uri info list. [absPath] is an absolute host path. */
     private fun prepareNativeRealPath(absPath: String) {
         session.setupContext(this)
         session.setupGamePathReal(absPath)
@@ -242,8 +231,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             "--storage_root=" + Utils.get_storage_root_path(),
             "--config=" + Application.get_global_config_file().absolutePath,
             "--log_file=" + Utils.get_log_file_path(),
-            // One app session = one xe.log: emulator runs append, the shelver
-            // rotates at the next app-session start.
+            // One app session = one xe.log: emulator runs append, the shelver rotates at
+            // the next app-session start.
             "--log_append=true",
         ))
         session.setupUriInfoListFile(Application.get_uri_info_list_file().absolutePath)
@@ -262,14 +251,12 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 val cfg by gamepad.config.collectAsState(initial = GamepadConfigDto())
                 val landscape = resources.configuration.orientation ==
                     Configuration.ORIENTATION_LANDSCAPE
-                // Recompose-trigger for boot gate: poll booted via a state hoisted in the host.
                 val booted by bootedState
                 val controls = remember(cfg, landscape) { gamepad.controlsFor(cfg, landscape) }
                 val (visible, poke) = rememberAutoHide(cfg.globals.autoHideSeconds)
                 val alpha by animateFloatAsState(
                     if (visible) cfg.globals.opacity else 0f, tween(500), label = "padAlpha")
 
-                // Adaptive contrast: on bright scenes the overlay tints toward grey so it stays visible.
                 val overlayActive = booted && cfg.globals.enabled
                 // onStart/onStop co-own the sampler thread: no PixelCopy polling while backgrounded.
                 DisposableEffect(overlayActive) {
@@ -279,15 +266,14 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 }
                 val contrastState = rememberOverlayContrast(brightnessSampler.brightness)
 
-                // Apply haptics pref each composition (cheap; reads cached field).
                 LaunchedEffect(cfg.globals.hapticsEnabled) {
                     configureHaptics(cfg.globals.hapticsEnabled)
                 }
                 Box(Modifier.fillMaxSize()) {
                     AndroidView(factory = { sv }, modifier = Modifier.fillMaxSize())
-                    // Stay MOUNTED whenever enabled (alpha drives only the DRAW): the
-                    // pointerInput must keep receiving touches so the auto-hide wake tap
-                    // fires, and so a held control is never unmounted mid-press (stuck).
+                    // Stay MOUNTED whenever enabled (alpha drives only the DRAW): the pointerInput
+                    // must keep receiving touches so the auto-hide wake tap fires, and so a held
+                    // control is never unmounted mid-press (stuck).
                     if (booted && cfg.globals.enabled) {
                         GamepadOverlay(
                             controls = controls,
@@ -302,10 +288,9 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                         )
                     }
                     val showFps by showFpsOverlay
-                    // The onCreate read of show_debug_overlay only saw the GLOBAL config;
-                    // xenia applies any per-game override on the detached boot thread, so
-                    // POLL the effective native cvar after boot. Without this, "global off
-                    // + per-game on" never shows the overlay.
+                    // The onCreate read only saw the GLOBAL config; the per-game override lands
+                    // on the detached boot thread, so POLL the effective cvar after boot, else
+                    // "global off + per-game on" never shows the overlay.
                     LaunchedEffect(booted) {
                         if (!booted) return@LaunchedEffect
                         while (isActive) {
@@ -325,7 +310,13 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                         if (!booted) return@LaunchedEffect
                         while (isActive) {
                             if (keyboardRequestState.value == null) {
-                                keyboardRequestState.value = session.keyboardRequest()
+                                session.keyboardRequest()?.let { req ->
+                                    keyboardTextState.value = clampToUtf16Units(
+                                        req.defaultText.orEmpty(),
+                                        if (req.maxLength <= 0) Int.MAX_VALUE else req.maxLength)
+                                    panelSelectedState.intValue = 0
+                                    keyboardRequestState.value = req
+                                }
                             }
                             delay(KEYBOARD_POLL_MS)
                         }
@@ -334,14 +325,36 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                         xendroidTheme {
                             GuestKeyboardPanel(
                                 request = req,
-                                onAccept = { text ->
-                                    session.keyboardSubmit(req.id, true, text)
-                                    keyboardRequestState.value = null
-                                },
-                                onCancel = {
-                                    session.keyboardSubmit(req.id, false, "")
-                                    keyboardRequestState.value = null
-                                },
+                                text = keyboardTextState.value,
+                                onTextChange = { keyboardTextState.value = it },
+                                selected = panelSelectedState.intValue,
+                                onAccept = { text -> acceptKeyboard(text) },
+                                onCancel = { cancelKeyboard() },
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
+                    }
+
+                    // Blocks the guest thread that asked, until answered.
+                    val messageBoxRequest by messageBoxRequestState
+                    LaunchedEffect(booted) {
+                        if (!booted) return@LaunchedEffect
+                        while (isActive) {
+                            if (messageBoxRequestState.value == null) {
+                                session.messageBoxRequest()?.let { req ->
+                                    panelSelectedState.intValue = req.activeButton
+                                    messageBoxRequestState.value = req
+                                }
+                            }
+                            delay(KEYBOARD_POLL_MS)
+                        }
+                    }
+                    messageBoxRequest?.let { req ->
+                        xendroidTheme {
+                            GuestMessageBoxPanel(
+                                request = req,
+                                selected = panelSelectedState.intValue,
+                                onChoose = { button -> answerMessageBox(button) },
                                 modifier = Modifier.fillMaxSize(),
                             )
                         }
@@ -353,7 +366,10 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                         if (!booted) return@LaunchedEffect
                         while (isActive) {
                             if (discRequestState.value == null) {
-                                discRequestState.value = session.discRequest()
+                                session.discRequest()?.let { req ->
+                                    panelSelectedState.intValue = 0
+                                    discRequestState.value = req
+                                }
                             }
                             delay(KEYBOARD_POLL_MS)
                         }
@@ -362,40 +378,30 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                         xendroidTheme {
                             DiscSwapPanel(
                                 request = req,
-                                onChoose = { path ->
-                                    session.discSubmit(req.id, true, path)
-                                    discRequestState.value = null
-                                },
-                                onCancel = {
-                                    session.discSubmit(req.id, false, "")
-                                    discRequestState.value = null
-                                },
+                                selected = panelSelectedState.intValue,
+                                onChoose = { path -> chooseDisc(path) },
+                                onCancel = { cancelDisc() },
                                 modifier = Modifier.fillMaxSize(),
                             )
                         }
                     }
                 }
 
-                // In-game menu: back / swipe-back PAUSES the game and opens a menu (Quit) instead
-                // of leaving to the library. The dialog itself catches back / tap-outside -> resume.
+                // Back / swipe-back PAUSES the game and opens a Quit menu instead of leaving to
+                // the library; the dialog catches back / tap-outside -> resume.
                 val menuOpen by menuOpenState
-                // Back cancels a text prompt instead of opening the menu. The gate below
-                // is what gives it priority; without it back pauses behind the prompt.
+                // The open-prompt gates below give a prompt's BackHandler priority over the
+                // menu one; without them back pauses behind the prompt.
                 val keyboardOpen = keyboardRequestState.value != null
                 val discOpen = discRequestState.value != null
-                BackHandler(enabled = keyboardOpen) {
-                    keyboardRequestState.value?.let { req ->
-                        session.keyboardSubmit(req.id, false, "")
-                        keyboardRequestState.value = null
-                    }
+                // No cancel: back answers with the button the guest pre-selected.
+                val messageBoxOpen = messageBoxRequestState.value != null
+                BackHandler(enabled = keyboardOpen) { cancelKeyboard() }
+                BackHandler(enabled = discOpen) { cancelDisc() }
+                BackHandler(enabled = messageBoxOpen) {
+                    messageBoxRequestState.value?.let { answerMessageBox(it.activeButton) }
                 }
-                BackHandler(enabled = discOpen) {
-                    discRequestState.value?.let { req ->
-                        session.discSubmit(req.id, false, "")
-                        discRequestState.value = null
-                    }
-                }
-                BackHandler(enabled = !menuOpen && !keyboardOpen && !discOpen) {
+                BackHandler(enabled = !menuOpen && !keyboardOpen && !discOpen && !messageBoxOpen) {
                     menuOpenState.value = true
                     if (session.booted) session.pause()
                 }
@@ -415,8 +421,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         sv.requestFocus()
     }
 
-    /** Honor the SAME legacy enable_vibrator pref AND the new globals flag (new wins when
-     *  set, else fall back to legacy so existing users keep their setting). */
+    /** Honors the legacy enable_vibrator pref too, so existing users keep their setting. */
     private fun configureHaptics(globalsFlag: Boolean) {
         val legacy = PreferenceManager.getDefaultSharedPreferences(this)
             .getBoolean("enable_vibrator", false)
@@ -429,7 +434,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         vibrator?.vibrate(VibrationEffect.createOneShot(25, VibrationEffect.DEFAULT_AMPLITUDE))
     }
 
-    // ---- SurfaceHolder.Callback: the load-bearing surface->boot ordering ----
+    // SurfaceHolder.Callback: the load-bearing surface->boot ordering.
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         if (!started) {
@@ -442,13 +447,13 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                     session.discSetKnown(labels.toList(), paths.toList())
                 }
                 session.bootOnce()
-                bootedState.value = true                  // reveal the SP4 overlay post-boot
+                bootedState.value = true
             } catch (t: RuntimeException) {
                 Log.e(TAG, "boot failed", t)
                 finish()                                  // fatal; single-shot core
             }
         } else {
-            // Post-rotation/background re-create: re-attach, resume; NEVER boot again.
+            // Post-rotation/background re-create: re-attach and resume, but NEVER boot again.
             // Stay paused if the in-game menu is open.
             session.attachSurface(holder.surface)
             if (!menuOpenState.value) session.resumeIfPaused()
@@ -463,32 +468,27 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         if (!started) return
-        // surfaceDestroyed fires BEFORE onStop here: pause first so the drain
-        // below tears down a quiescent GPU. onStop's pause() is then a no-op.
+        // surfaceDestroyed fires BEFORE onStop here: pause first so the drain below tears
+        // down a quiescent GPU. onStop's pause() is then a no-op.
         if (session.booted) session.pause()
-        session.detachSurface()                           // synchronous GPU drain (SP0)
+        session.detachSurface()                           // synchronous GPU drain
     }
-
-    // ---- Lifecycle teardown ----
 
     override fun onPause() {
         super.onPause()
-        session.flushGpuCaches()                          // best-effort; never throws
+        session.flushGpuCaches()
     }
 
     override fun onStop() {
         super.onStop()
-        // Freeze guest CPU + GPU command worker + audio (audio goes silent) when the
-        // activity is stopped (screen sleep / home / app switch). Direct, blocking,
-        // main-thread call (Emulator::Pause does its own fences). Gated on booted so a
-        // stop during the boot splash is a no-op, matching the keyEvent !booted guard.
+        // Freeze guest CPU + GPU worker + audio when stopped (screen sleep / home / switch).
         // Ordering: onPause(flushGpuCaches) -> onStop(pause) -> surfaceDestroyed(detach);
-        // pausing BEFORE the swapchain teardown means no guest/GPU frames race the drain.
+        // pausing BEFORE the swapchain teardown keeps guest/GPU frames from racing the drain.
         mainHandler.removeCallbacks(pauseOnFocusLost)
         if (session.booted) session.pause()
-        brightnessSampler.stop()                          // no PixelCopy polling while stopped
-        // Last: an orphaned core (main process died while we were on screen) hard-kills
-        // here, so it does so from a paused, quiescent state.
+        brightnessSampler.stop()
+        // An orphaned core (main process died while we were on screen) hard-kills here, so it
+        // does so from a paused, quiescent state.
         EmuProcessLink.setEmuForeground(false)
     }
 
@@ -496,11 +496,9 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         super.onStart()
         EmuProcessLink.setEmuForeground(true)
         if (overlayWantsBrightness) surfaceView?.let { brightnessSampler.start(it) }
-        // Mirror of onStop. resumeIfPaused() (not bare resume) stays idempotent: the
-        // swapchain-recreate path already calls resumeIfPaused() in surfaceCreated
-        // (line 246), so this second call is a no-op there; onStart additionally covers
-        // the pure screen-sleep case where the surface was NOT destroyed. Stay paused if the
-        // in-game menu is open (don't run the game behind the menu after returning).
+        // resumeIfPaused (not bare resume) is idempotent: surfaceCreated already resumes on
+        // swapchain-recreate, so this is a no-op there; onStart additionally covers the pure
+        // screen-sleep case where the surface was NOT destroyed. Stay paused if the menu is open.
         if (session.booted && !menuOpenState.value) session.resumeIfPaused()
     }
 
@@ -511,15 +509,21 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         session.keyboardCancelAll()
         discRequestState.value = null
         session.discCancelAll()
-        // Hard-kill via SIGKILL (single-shot core). killProcess skips the C++ atexit
-        // static-destructor path that System.exit(0) ran, which can deadlock joining a
-        // paused audio worker and wedge :emu instead of closing it.
+        messageBoxRequestState.value = null
+        session.messageBoxCancelAll()
+        // Hard-kill via SIGKILL: killProcess skips the C++ atexit static-destructor path
+        // that System.exit(0) ran, which can deadlock joining a paused audio worker and
+        // wedge :emu instead of closing it.
         Process.killProcess(Process.myPid())
     }
 
-    // ---- Hardware input -> session.keyEvent ----
-
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        val nav = panelNav()
+        if (nav != null) {
+            if (panelKeyDown(nav, keyCode)) return true
+            // Swallow the rest so neither the game nor an OEM overlay reacts behind it.
+            if (consumeIfGamepad(event)) return true
+        }
         val gameKey = keyMap[keyCode]
             ?: return consumeIfGamepad(event) || super.onKeyDown(keyCode, event)
         if (event.repeatCount == 0) {
@@ -530,14 +534,17 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (panelNav() != null && (isPanelKey(keyCode) || consumeIfGamepad(event))) {
+            return true
+        }
         val gameKey = keyMap[keyCode]
             ?: return consumeIfGamepad(event) || super.onKeyUp(keyCode, event)
         session.keyEvent(gameKey, false, KEY_VALUE_UNUSED)
         return true
     }
 
-    /** Unmapped controller buttons (never BACK): unhandled gamepad input is what OEM
-     *  overlays latch onto. */
+    /** Consumes unmapped controller buttons (never BACK): unhandled gamepad input is what
+     *  OEM overlays latch onto. */
     private fun consumeIfGamepad(event: KeyEvent): Boolean =
         event.keyCode != KeyEvent.KEYCODE_BACK &&
             (event.source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
@@ -546,25 +553,27 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     /** The SurfaceView listener only fires while that view holds focus. */
     override fun onGenericMotionEvent(event: MotionEvent): Boolean = onGenericMotion(event)
 
-    /** Joystick axes + hat (D-pad). Mirrors EmulatorActivity.onGenericMotion/handle_dpad. */
+    /** Joystick axes + hat (D-pad). */
     private fun onGenericMotion(event: MotionEvent): Boolean {
+        panelNav()?.let { nav ->
+            panelHat(nav, event)
+            return true
+        }
         // No early return: sticks/triggers must still process while a hat is held.
         val hatHandled = isNonDpadSource(event) && handleHat(event)
         if (event.source and InputDevice.SOURCE_JOYSTICK != InputDevice.SOURCE_JOYSTICK) {
             return hatHandled || super.onGenericMotionEvent(event)
         }
-        // Left stick
         emitAxisPair(event.getAxisValue(MotionEvent.AXIS_X),
             negKey = KC_LTHUMB_LEFT, posKey = KC_LTHUMB_RIGHT, invert = false)
         emitAxisPair(event.getAxisValue(MotionEvent.AXIS_Y),
-            negKey = KC_LTHUMB_UP, posKey = KC_LTHUMB_DOWN, invert = true)   // Y inverted
-        // Right stick (Z / RZ)
+            negKey = KC_LTHUMB_UP, posKey = KC_LTHUMB_DOWN, invert = true)
         emitAxisPair(event.getAxisValue(MotionEvent.AXIS_Z),
             negKey = KC_RTHUMB_LEFT, posKey = KC_RTHUMB_RIGHT, invert = false)
         emitAxisPair(event.getAxisValue(MotionEvent.AXIS_RZ),
             negKey = KC_RTHUMB_UP, posKey = KC_RTHUMB_DOWN, invert = true)
-        // Triggers: digital game keys, but most pads report them as ANALOG axes (LTRIGGER/RTRIGGER,
-        // or BRAKE/GAS on others). Emit a press past the threshold, edge-detected so we don't spam.
+        // Most pads report triggers as ANALOG axes (LTRIGGER/RTRIGGER, or BRAKE/GAS). Emit a
+        // press past the threshold, edge-detected so we don't spam.
         lTriggerDown = emitTrigger(
             maxOf(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_BRAKE)),
             KC_TRIGGER_L, lTriggerDown)
@@ -582,7 +591,6 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     /** For one axis emit the opposing thumb directions, scaled to signed-short range.
-     *  negative -> negKey pressed with |v|, posKey released; positive -> posKey; 0 -> both released.
      *  invert flips sign first (screen Y is up-negative; X360 up is positive). */
     private fun emitAxisPair(axis: Float, negKey: Int, posKey: Int, invert: Boolean) {
         val raw = if (invert) -axis else axis
@@ -591,7 +599,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         when {
             v < 0f -> {
                 emitAxis(posKey, false, 0)
-                emitAxis(negKey, true, (v * 32768f).toInt())                  // negative magnitude
+                emitAxis(negKey, true, (v * 32768f).toInt())
             }
             v > 0f -> {
                 emitAxis(negKey, false, 0)
@@ -604,7 +612,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
     }
 
-    // Last value pushed per analog code. Motion events arrive per sample (~120Hz x 4 axes)
+    // Last value pushed per analog code: motion events arrive per sample (~120Hz x 4 axes)
     // and mostly repeat, so without this every sample costs ~10 JNI calls.
     private val axisPressed = BooleanArray(24)
     private val axisValue = IntArray(24) { Int.MIN_VALUE }
@@ -616,8 +624,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         session.keyEvent(code, pressed, value)
     }
 
-    // Hat D-pad state, edge-detected: the hat only releases what IT pressed, so
-    // it can't clobber a D-pad held via real KEYCODE_DPAD_* key events.
+    // Hat D-pad state, edge-detected: the hat only releases what IT pressed, so it can't
+    // clobber a D-pad held via real KEYCODE_DPAD_* key events.
     private var hatLeft = false
     private var hatUp = false
     private var hatRight = false
@@ -646,15 +654,129 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         return left || right || up || down
     }
 
-    /** Legacy isDpadDevice: TRUE when the device is NOT a SOURCE_DPAD (i.e. treat as
-     *  joystick/hat). Name kept descriptive here. */
+    /** TRUE when the device is NOT a SOURCE_DPAD (treat as joystick/hat). */
     private fun isNonDpadSource(event: MotionEvent): Boolean =
         event.source and InputDevice.SOURCE_DPAD != InputDevice.SOURCE_DPAD
+
+    // Guest-panel navigation is routed here rather than through Compose focus because on
+    // this hardware the D-pad arrives as HAT AXES on a MotionEvent, never reaching a composable.
+
+    /** The open panel's selectable options. Checked in z-order, topmost first; null when no
+     *  panel is open. */
+    private class PanelNav(
+        val count: Int,
+        val activate: (Int) -> Unit,
+        val cancel: () -> Unit,
+    )
+
+    private fun panelNav(): PanelNav? {
+        discRequestState.value?.let { req ->
+            val paths = req.discPaths ?: emptyArray()
+            val discs = minOf(req.discLabels?.size ?: 0, paths.size)
+            // Cancel is the last option.
+            return PanelNav(discs + 1,
+                { i -> if (i < discs) chooseDisc(paths[i]) else cancelDisc() },
+                { cancelDisc() })
+        }
+        messageBoxRequestState.value?.let { req ->
+            return PanelNav(req.buttons?.size ?: 0,
+                { i -> answerMessageBox(i) },
+                { answerMessageBox(req.activeButton) })
+        }
+        keyboardRequestState.value?.let {
+            return PanelNav(2,
+                { i -> if (i == 0) acceptKeyboard(keyboardTextState.value) else cancelKeyboard() },
+                { cancelKeyboard() })
+        }
+        return null
+    }
+
+    private fun isPanelKey(keyCode: Int): Boolean = when (keyCode) {
+        KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_LEFT,
+        KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT,
+        KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+        KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_B -> true
+        else -> false
+    }
+
+    private fun panelKeyDown(nav: PanelNav, keyCode: Int): Boolean = when (keyCode) {
+        KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_LEFT -> {
+            movePanelSelection(nav, -1); true
+        }
+        KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+            movePanelSelection(nav, 1); true
+        }
+        KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+        KeyEvent.KEYCODE_BUTTON_A -> {
+            nav.activate(panelSelectedState.intValue); true
+        }
+        KeyEvent.KEYCODE_BUTTON_B -> {
+            nav.cancel(); true
+        }
+        else -> false
+    }
+
+    // Edge-detected, and shared by hat and left stick so holding either only steps once.
+    private var panelNavPrev = false
+    private var panelNavNext = false
+
+    private fun panelHat(nav: PanelNav, event: MotionEvent) {
+        val y = event.getAxisValue(MotionEvent.AXIS_HAT_Y) + event.getAxisValue(MotionEvent.AXIS_Y)
+        val x = event.getAxisValue(MotionEvent.AXIS_HAT_X) + event.getAxisValue(MotionEvent.AXIS_X)
+        val prev = y < -0.5f || x < -0.5f
+        val next = y > 0.5f || x > 0.5f
+        if (prev != panelNavPrev) {
+            panelNavPrev = prev
+            if (prev) movePanelSelection(nav, -1)
+        }
+        if (next != panelNavNext) {
+            panelNavNext = next
+            if (next) movePanelSelection(nav, 1)
+        }
+    }
+
+    private fun movePanelSelection(nav: PanelNav, delta: Int) {
+        if (nav.count <= 0) return
+        val next = panelSelectedState.intValue + delta
+        panelSelectedState.intValue = ((next % nav.count) + nav.count) % nav.count
+    }
+
+    // Guest panel answers. Each releases the blocked guest thread exactly once.
+
+    private fun answerMessageBox(button: Int) {
+        val req = messageBoxRequestState.value ?: return
+        session.messageBoxSubmit(req.id, button)
+        messageBoxRequestState.value = null
+    }
+
+    private fun chooseDisc(path: String) {
+        val req = discRequestState.value ?: return
+        session.discSubmit(req.id, true, path)
+        discRequestState.value = null
+    }
+
+    private fun cancelDisc() {
+        val req = discRequestState.value ?: return
+        session.discSubmit(req.id, false, "")
+        discRequestState.value = null
+    }
+
+    private fun acceptKeyboard(text: String) {
+        val req = keyboardRequestState.value ?: return
+        session.keyboardSubmit(req.id, true, text)
+        keyboardRequestState.value = null
+    }
+
+    private fun cancelKeyboard() {
+        val req = keyboardRequestState.value ?: return
+        session.keyboardSubmit(req.id, false, "")
+        keyboardRequestState.value = null
+    }
 }
 
-/** Brightness -> overlay contrast, collected in a coroutine so emissions never recompose;
- *  consumers read the State in the draw phase only. The target is quantized to 1/8 steps so
- *  EMA jitter re-targets the same value instead of restarting the tween forever. */
+/** Brightness -> overlay contrast, collected in a coroutine so emissions never recompose.
+ *  The target is quantized to 1/8 steps so EMA jitter re-targets the same value instead of
+ *  restarting the tween forever. */
 @Composable
 private fun rememberOverlayContrast(brightness: StateFlow<Float>): State<Float> {
     val anim = remember { Animatable(0f) }

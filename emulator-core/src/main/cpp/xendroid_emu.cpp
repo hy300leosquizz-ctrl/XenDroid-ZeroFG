@@ -39,6 +39,7 @@
 #include "xe_android_hid.h"
 #include "xe_android_input_driver.h"
 #include "xe_android_disc_swap.h"
+#include "xe_android_message_box.h"
 #include "xe_android_text_input.h"
 #include "xe_opensles_audio_system.h"
 #include "xe_aaudio_audio_system.h"
@@ -59,6 +60,10 @@ DEFINE_bool(android_soft_keyboard, true,
 DEFINE_bool(android_disc_swap, true,
             "Ask which disc to insert when a multi-disc game requests one, "
             "instead of leaving the drive empty.",
+            "UI");
+DEFINE_bool(android_message_box, true,
+            "Show a game's message boxes as an Android dialog, instead of "
+            "answering them with the button the game pre-selected.",
             "UI");
 DEFINE_string(hid, "android", "Input system. Use: [android, nop]",
               "HID");
@@ -335,6 +340,10 @@ bool EmulatorApp::OnInitialize() {
     // ui::Window.
     if (cvars::android_disc_swap) {
         xendroid::InstallDiscSwapProvider();
+    }
+    // Otherwise headless silently answers with the game's own default button.
+    if (cvars::android_message_box) {
+        xendroid::InstallMessageBoxProvider();
     }
 
 #if XE_ARCH_AMD64 == 1

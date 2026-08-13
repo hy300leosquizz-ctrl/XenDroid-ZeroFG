@@ -1,16 +1,13 @@
 package xendroid.compose.data
 
-/**
- * Container formats the one-level library scan recognizes, mirroring legacy
- * Filter.is_iso_file / is_zar_file / is_god_game (MainActivity.java:449-469).
- * XEX_FOLDER is handled separately (it's a directory, not a filename match).
- */
+/** Container formats the library scan recognizes. XEX_FOLDER is a directory, not a
+ *  filename match, so it is handled separately. */
 enum class GameFormat {
     ISO, ZAR, GOD, XEX_FOLDER, STFS;
 
     /** Display name from a *file* name (XEX folders use the folder name verbatim). */
     fun displayNameFor(fileName: String): String = when (this) {
-        ISO, ZAR -> fileName.dropLast(4)   // strip ".iso"/".zar"
+        ISO, ZAR -> fileName.dropLast(4)
         GOD, XEX_FOLDER, STFS -> fileName  // STFS containers are extensionless
     }
 
@@ -19,20 +16,20 @@ enum class GameFormat {
     val titleIdCode: Int? get() = when (this) {
         ISO -> 0
         XEX_FOLDER -> 1
-        ZAR -> 2           // mounts the .zar disc + reads default.xex's XDBF
+        ZAR -> 2
         GOD -> null        // GOD uses its own GameInfo reader
         STFS -> null       // STFS reads its title id from the content_header
     }
 
     companion object {
-        /** File-name -> format, or null if it's an ignored file. Detection order
-         *  matches the scan: .iso, then .zar, then extensionless => GOD. */
+        /** File-name -> format, or null if ignored. Detection order matches the scan:
+         *  .iso, then .zar, then extensionless => GOD. */
         fun fromFileName(name: String): GameFormat? {
             val lower = name.lowercase()
             return when {
                 lower.endsWith(".iso") -> ISO
                 lower.endsWith(".zar") -> ZAR
-                !name.contains('.') -> GOD   // is_god_game: indexOf('.') == -1
+                !name.contains('.') -> GOD
                 else -> null
             }
         }

@@ -19,13 +19,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -36,30 +32,30 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import xendroid.compose.Emulator
+import xendroid.compose.ui.panel.GuestPanelOption
 
 /**
- * Answers a guest text-entry prompt (XamShowKeyboardUI).
+ * Answers a guest text-entry prompt (XamShowKeyboardUI). An in-window Surface, not a Dialog:
+ * a Dialog takes window focus and trips the host's focus-loss pause. A kernel dispatch thread
+ * is held until answered, so [onAccept]/[onCancel] must fire for every request. [text] is
+ * hoisted so the host can submit it when the controller picks OK; [selected] (0 = OK, 1 =
+ * Cancel) is driven by the host because the D-pad arrives as hat axes that never reach a
+ * composable.
  *
- * An in-window Surface, not a Dialog: a Dialog takes window focus and would trip
- * the host activity's focus-loss pause. The emulator holds a kernel dispatch
- * thread until answered, so [onAccept]/[onCancel] must fire for every request.
- *
- * Laid out for a landscape-locked window with windowSoftInputMode=adjustNothing:
- * the IME leaves very little height and the window never resizes, so the panel is
- * top-aligned rather than centred, which also survives the API 29 devices that do
- * not report IME insets at all.
+ * Top-aligned, not centred: with windowSoftInputMode=adjustNothing the window never resizes
+ * around the IME, and API 29 devices report no IME insets at all.
  */
 @Composable
 fun GuestKeyboardPanel(
     request: Emulator.KeyboardRequest,
+    text: String,
+    onTextChange: (String) -> Unit,
+    selected: Int,
     onAccept: (String) -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val maxUnits = request.maxLength.let { if (it <= 0) Int.MAX_VALUE else it }
-    var text by remember(request.id) {
-        mutableStateOf(clampToUtf16Units(request.defaultText.orEmpty(), maxUnits))
-    }
     val focusRequester = remember(request.id) { FocusRequester() }
 
     LaunchedEffect(request.id) { focusRequester.requestFocus() }
@@ -101,7 +97,7 @@ fun GuestKeyboardPanel(
                 }
                 OutlinedTextField(
                     value = text,
-                    onValueChange = { text = clampToUtf16Units(it, maxUnits) },
+                    onValueChange = { onTextChange(clampToUtf16Units(it, maxUnits)) },
                     singleLine = true,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -112,12 +108,25 @@ fun GuestKeyboardPanel(
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = { onAccept(text) }),
                 )
+                // Side by side: two short labels, and the IME leaves little height.
                 Row(
-                    Modifier.fillMaxWidth().padding(top = if (compact) 4.dp else 12.dp),
-                    horizontalArrangement = Arrangement.End,
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(top = if (compact) 8.dp else 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    TextButton(onClick = onCancel) { Text("Cancel") }
-                    TextButton(onClick = { onAccept(text) }) { Text("OK") }
+                    GuestPanelOption(
+                        label = "OK",
+                        selected = selected == 0,
+                        onClick = { onAccept(text) },
+                        modifier = Modifier.weight(1f),
+                    )
+                    GuestPanelOption(
+                        label = "Cancel",
+                        selected = selected == 1,
+                        onClick = onCancel,
+                        modifier = Modifier.weight(1f),
+                    )
                 }
             }
         }

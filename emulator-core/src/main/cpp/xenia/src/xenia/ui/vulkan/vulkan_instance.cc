@@ -61,6 +61,28 @@ DEFINE_string(
         "rather than hidden. Empty leaves TU_DEBUG unset.",
         "Vulkan");
 UPDATE_from_string(turnip_debug, 2026, 7, 24, 12, "");
+
+DEFINE_string(
+    ir3_debug, "",
+    "Comma-separated IR3_DEBUG flags for the Turnip shader compiler, e.g. "
+    "nopreamble or noearlypreamble to keep uniform math out of the shader "
+    "preamble. Empty leaves IR3_DEBUG unset.",
+    "Vulkan");
+
+DEFINE_string(
+    turnip_perf_sampler, "",
+    "Enable the instrumented Turnip build's whole-GPU KGSL performance "
+    "counter sampler. Empty disables it. \"1\" samples the default triage "
+    "set; \"tp\" swaps in the deeper texture-unit set (TP has only 12 "
+    "physical slots, so the two sets are mutually exclusive).\n"
+    "Requires a Turnip build containing the sampler; ignored otherwise.",
+    "Vulkan");
+DEFINE_int32(turnip_perf_sampler_period_ms, 100,
+             "Poll period in milliseconds for turnip_perf_sampler.", "Vulkan");
+DEFINE_string(turnip_perf_sampler_file, "",
+              "Report path for turnip_perf_sampler. Empty writes to the app's "
+              "files directory as tu_perf.log.",
+              "Vulkan");
 #endif
 
 DEFINE_bool(
@@ -122,6 +144,26 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
     if (!tu_debug.empty()) {
       setenv("TU_DEBUG", tu_debug.c_str(), 1);
       XELOGI("Set TU_DEBUG={} for the Turnip Vulkan driver", tu_debug);
+    }
+    // Read when the compiler is created, so set it before the driver loads.
+    if (!std::string(cvars::ir3_debug).empty()) {
+      setenv("IR3_DEBUG", cvars::ir3_debug.c_str(), 1);
+      XELOGI("Set IR3_DEBUG={} for the Turnip shader compiler",
+             cvars::ir3_debug);
+    }
+    // Whole-GPU hardware counter sampler in the instrumented Turnip build.
+    // Read at device creation like TU_DEBUG, so it must be set before load.
+    if (!std::string(cvars::turnip_perf_sampler).empty()) {
+      setenv("TU_PERF_SAMPLER", cvars::turnip_perf_sampler.c_str(), 1);
+      setenv("TU_PERF_SAMPLER_PERIOD_MS",
+             std::to_string(cvars::turnip_perf_sampler_period_ms).c_str(), 1);
+      if (!std::string(cvars::turnip_perf_sampler_file).empty()) {
+        setenv("TU_PERF_SAMPLER_FILE", cvars::turnip_perf_sampler_file.c_str(),
+               1);
+      }
+      XELOGI("Set TU_PERF_SAMPLER={} (period {}ms) for the Turnip driver",
+             cvars::turnip_perf_sampler,
+             cvars::turnip_perf_sampler_period_ms);
     }
     std::string custom_lib_path=cvars::vulkan_lib_path;
     bool custom_lib_exists =

@@ -66,35 +66,28 @@ fun GameLibraryScreen(
     val scope = rememberCoroutineScope()
     var updateResult by remember { mutableStateOf<UpdateResult?>(null) }
 
-    // The long-press menu target (per-game settings, optionally shortcut).
     var pendingGame by remember { mutableStateOf<Game?>(null) }
-    // Long-press "Compress to .zar" (ISO only): the game awaiting the confirm dialog.
     var compressConfirmFor by remember { mutableStateOf<Game?>(null) }
     val compressState by compressVm.state.collectAsStateWithLifecycle()
     val titleIdState by viewModel.titleIdState.collectAsStateWithLifecycle()
     val isRefreshing by viewModel.isRefreshing.collectAsStateWithLifecycle()
 
-    // Real-path (All Files Access) mode: hosts the built-in File browser when shown.
-    // Re-checked on ON_START so a grant made in Settings is observed on return.
     var showBrowser by remember { mutableStateOf(false) }
     var allFilesGranted by remember { mutableStateOf(AllFilesAccess.isGranted()) }
-    // Start real-path mode: if not yet granted, send the user to Settings; once granted,
-    // open the in-app folder browser. (Grant returns no result -> observed on ON_START.)
+    // Not-yet-granted sends the user to Settings; the grant returns no result, so it is
+    // observed on the next ON_START.
     val startRealPathMode: () -> Unit = {
         if (AllFilesAccess.isGranted()) showBrowser = true
         else AllFilesAccess.requestAccess(context)
     }
 
-    // Re-scan when the app returns to the foreground (picks up games added while it was
-    // backgrounded). The ViewModel's init does the first cold-start load, so the first
-    // ON_START is skipped to avoid doubling it.
+    // Re-scan on return to foreground to pick up games added while backgrounded. The
+    // ViewModel's init does the first cold-start load, so the first ON_START is skipped.
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         var firstStart = true
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_START) {
-                // Re-check the All Files Access grant (no result payload): a grant made in
-                // Settings while we were backgrounded is observed here on return.
                 allFilesGranted = AllFilesAccess.isGranted()
                 if (firstStart) firstStart = false else viewModel.refresh()
             }
@@ -103,8 +96,6 @@ fun GameLibraryScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Real-path mode: the built-in File folder browser takes over the screen while open.
-    // Choosing a folder persists it (switching to real-path mode) + rescans, then closes.
     if (showBrowser) {
         FolderBrowserScreen(
             onFolderChosen = { path ->
@@ -129,8 +120,8 @@ fun GameLibraryScreen(
                         Icon(Icons.Default.MoreVert, contentDescription = "More")
                     }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                        // Set game folder via All Files Access (real-path). Only offered where
-                        // All Files Access exists (API 30+); on API 29 the empty state explains why.
+                        // Only offered where All Files Access exists (API 30+); on API 29 the
+                        // empty state explains why.
                         if (AllFilesAccess.isSupported) {
                             DropdownMenuItem(
                                 text = { Text("Set game folder") },
@@ -188,8 +179,6 @@ fun GameLibraryScreen(
             modifier = Modifier.fillMaxSize().padding(padding),
         ) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            // The folder is set via All Files Access (real-path). The primary empty-state
-            // button starts that flow; its label reflects whether the grant is already held.
             val setFolderLabel = if (allFilesGranted) "Set game folder" else "Grant All Files Access"
             when (val s = state) {
                 LibraryUiState.NoVulkan ->
@@ -218,16 +207,13 @@ fun GameLibraryScreen(
                         viewModel = viewModel,
                         onLaunch = { game ->
                             runCatching {
-                                // Reap any stale/orphaned :emu first (single-shot core). The
-                                // new :emu links itself to this process by binding
-                                // MainAliveService, so nothing rides on the Intent - which is
-                                // also why pinned shortcuts now get the same link.
+                                // Reap any stale/orphaned :emu first (single-shot core). The new
+                                // :emu links itself to this process by binding MainAliveService,
+                                // so nothing rides on the Intent.
                                 EmuProcessLink.killStaleEmu(context)
                                 context.startActivity(viewModel.buildLaunchIntent(game))
                             }
                         },
-                        // Long-press opens the per-game menu (independent of canLaunchGames,
-                        // which only gates the shortcut affordance inside the dialog).
                         onLongPress = { pendingGame = it },
                     )
             }
@@ -268,8 +254,7 @@ fun GameLibraryScreen(
             sheetState = sheetState,
         ) {
             Column {
-                // Sheet header: prominent game name; the title-id status line shows ONLY
-                // while resolving or on error (no static subtitle otherwise).
+                // The title-id status line shows ONLY while resolving or on error.
                 val statusContent: (@Composable () -> Unit)? = when (val st = titleIdState) {
                     is TitleIdState.Loading -> ({
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -305,7 +290,6 @@ fun GameLibraryScreen(
                     },
                 )
 
-                // Per-game settings — disabled (and visually dimmed) while the title id resolves.
                 val perGameEnabled = titleIdState !is TitleIdState.Loading
                 ListItem(
                     headlineContent = { Text("Per-game settings") },
@@ -322,8 +306,6 @@ fun GameLibraryScreen(
                     },
                 )
 
-                // Game patches — bundled xenia patches for this title (all formats; title id is
-                // read boot-free, including ZAR via ExtractZarMetadata).
                 ListItem(
                     headlineContent = { Text("Game patches") },
                     colors = if (perGameEnabled) {
@@ -339,8 +321,6 @@ fun GameLibraryScreen(
                     },
                 )
 
-                // Manage content — install, list and remove DLC + title updates for this game
-                // (title id resolved boot-free, same as patches above).
                 ListItem(
                     headlineContent = { Text("Manage content") },
                     colors = if (perGameEnabled) {
@@ -356,7 +336,6 @@ fun GameLibraryScreen(
                     },
                 )
 
-                // ISO-only: pack this disc into a smaller .zar.
                 if (game.format == GameFormat.ISO) {
                     ListItem(
                         headlineContent = { Text("Compress to .zar") },
@@ -368,7 +347,6 @@ fun GameLibraryScreen(
                     )
                 }
 
-                // Shortcut affordance when a launchable host exists.
                 if (viewModel.canLaunchGames && viewModel.isPinShortcutSupported) {
                     ListItem(
                         headlineContent = { Text("Create shortcut") },
@@ -382,7 +360,6 @@ fun GameLibraryScreen(
         }
     }
 
-    // Once resolved, navigate to the editor or the patches screen, then reset dialog + request.
     LaunchedEffect(titleIdState) {
         (titleIdState as? TitleIdState.Resolved)?.let { r ->
             when (r.action) {
@@ -398,17 +375,15 @@ fun GameLibraryScreen(
         }
     }
 
-    // ISO -> .zar compress, launched straight from the long-press popup. Confirm, then
-    // GameCompressViewModel runs the safe compress+verify+replace; refresh on Done so the
-    // .iso entry turns into the new .zar in the grid.
     compressConfirmFor?.let { game ->
         AlertDialog(
             onDismissRequest = { compressConfirmFor = null },
             title = { Text("Compress to .zar?") },
             text = {
                 Text(
-                    "This packs the disc into a smaller .zar. The original .iso is deleted " +
-                        "only after the .zar is created and verified. The game stays in your library.")
+                    "This packs the disc into a smaller .zar. The original .iso is left alone " +
+                        "until the .zar is created and verified, and you are asked before it is " +
+                        "deleted. The game stays in your library.")
             },
             confirmButton = {
                 TextButton(onClick = {
@@ -441,6 +416,20 @@ fun GameLibraryScreen(
                 }
             },
             confirmButton = {},
+        )
+        is CompressState.ConfirmDelete -> AlertDialog(
+            // Dismissing keeps it: a stray tap outside must never delete the .iso.
+            onDismissRequest = compressVm::keepIso,
+            title = { Text("Delete the original .iso?") },
+            text = {
+                Text(
+                    "“${s.zarName}” was created and verified. Deleting “${s.isoName}” " +
+                        "frees ${formatBytes(s.isoBytes)}.")
+            },
+            confirmButton = {
+                TextButton(onClick = compressVm::deleteIso) { Text("Delete .iso") }
+            },
+            dismissButton = { TextButton(onClick = compressVm::keepIso) { Text("Keep it") } },
         )
         is CompressState.Done -> AlertDialog(
             onDismissRequest = { compressVm.dismiss(); viewModel.refresh() },
@@ -488,8 +477,8 @@ private fun GameCell(
     onLongPress: (Game) -> Unit,
 ) {
     val context = LocalContext.current
-    // Resolve the icon model once per cell (the File.exists() stat must not run on
-    // every recomposition while scrolling).
+    // Once per cell: the File.exists() stat must not run on every recomposition while
+    // scrolling.
     val iconModel = remember(game.stableId) { viewModel.iconFileOrFallback(game) }
     Column(
         Modifier
@@ -499,7 +488,7 @@ private fun GameCell(
     ) {
         AsyncImage(
             model = ImageRequest.Builder(context)
-                .data(iconModel)   // File or app_icon res id
+                .data(iconModel)
                 .build(),
             contentDescription = game.name,
             modifier = Modifier.size(96.dp),
@@ -566,4 +555,14 @@ fun checkForUpdatesClicked(
             Log.e("Updater", "Failed to check updates", e)
         }
     }
+}
+
+/** Same shape as the content-install formatter, which is private to that file. */
+private fun formatBytes(b: Long): String {
+    if (b < 1024) return "$b B"
+    val u = arrayOf("KB", "MB", "GB", "TB")
+    var v = b.toDouble()
+    var i = -1
+    do { v /= 1024.0; i++ } while (v >= 1024.0 && i < u.lastIndex)
+    return "%.1f %s".format(v, u[i])
 }

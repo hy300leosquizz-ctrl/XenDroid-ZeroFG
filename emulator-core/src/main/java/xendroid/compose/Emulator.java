@@ -99,6 +99,10 @@ public class Emulator extends xendroid.emulator.Emulator{
     // Fail every waiting request.
     public native void keyboard_cancel_all();
 
+    public native MessageBoxRequest msgbox_request();
+    public native void msgbox_submit(long id, int button);
+    public native void msgbox_cancel_all();
+
     public native DiscSwapRequest disc_request();
     public native void disc_submit(long id, boolean accepted, String path);
     public native void disc_cancel_all();
@@ -203,6 +207,16 @@ public class Emulator extends xendroid.emulator.Emulator{
         public String defaultText; // clamped to maxLength
         public int maxLength;      // UTF-16 code units, terminator excluded
         public int flags;          // raw guest flags
+    }
+
+    /** A pending guest message box (XamShowMessageBoxUI). */
+    public static class MessageBoxRequest {
+        public long id;           // stale ids are ignored
+        public String title;
+        public String text;
+        public String[] buttons;  // the guest's own labels, at least one
+        public int activeButton;  // index the guest pre-focused
+        public int flags;         // raw guest flags
     }
 
     /** A pending guest disc-swap prompt. */

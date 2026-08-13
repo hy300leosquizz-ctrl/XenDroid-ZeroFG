@@ -8,35 +8,31 @@ import org.junit.Test
 import xendroid.compose.settings.Setting
 import xendroid.compose.settings.SettingsSchema
 
-/** Schema-integrity checks (no emulator / JNI needed): assert exact entry counts,
- *  uniqueness, and per-list well-formedness. */
+/** Schema-integrity checks (no emulator / JNI needed). */
 class SettingsSchemaTest {
 
     private val all = SettingsSchema.allSettings
 
-    // Expected inventory: 88 Bool + 10 IntRange + 20 ListChoice + 2 Action = 120.
-    // Notable typings: Display|host_present_from_non_ui_thread is intentionally absent
-    // (must be true on Android -- forced natively, false black-screens the app -- so it
-    // is not a valid user choice). GPU|readback_resolve and APU|xma_decoder are string
-    // cvars (fast/some/full/none and the decoder name), hence ListChoice rather than Bool.
-    @Test fun total_entry_count_is_120() {
-        assertEquals(120, all.size)
+    // 98 Bool + 12 IntRange + 21 ListChoice + 2 Action = 133. Display|host_present_from_non_ui_thread
+    // is intentionally absent (forced true natively; not a valid user choice).
+    @Test fun total_entry_count_is_133() {
+        assertEquals(133, all.size)
         assertEquals(
-            120,
+            133,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action },
         )
     }
 
     @Test fun counts_by_type_match_verified_inventory() {
-        assertEquals(88, all.count { it is Setting.Bool })
-        assertEquals(10, all.count { it is Setting.IntRange })
-        assertEquals(20, all.count { it is Setting.ListChoice })
+        assertEquals(98, all.count { it is Setting.Bool })
+        assertEquals(12, all.count { it is Setting.IntRange })
+        assertEquals(21, all.count { it is Setting.ListChoice })
         assertEquals(2, all.count { it is Setting.Action })
     }
 
-    /** Keys the app looks up by string with a hard cast, so a section move that
-     *  changes the key must not go unnoticed. */
+    /** These keys are looked up by string with a hard cast, so a section move that changes
+     *  the key must not go unnoticed. */
     @Test fun keys_referenced_by_code_resolve_to_the_right_type() {
         listOf("Console|user_language", "Console|user_country").forEach { key ->
             val s = SettingsSchema.byKey[key]
@@ -103,8 +99,8 @@ class SettingsSchemaTest {
             assertEquals(2, it.min); assertEquals(63, it.max); assertEquals(8, it.default)
         }
         ir("GPU|texture_cache_memory_limit_soft").let {
-            // min deliberately diverges from the legacy XML (512): that floor was above the
-            // real TOML default (384), which would have silently coerced the default upward.
+            // min == the real TOML default (384); a higher floor would silently coerce the
+            // default upward.
             assertEquals(384, it.min); assertEquals(4096, it.max); assertEquals(384, it.default)
         }
         ir("GPU|texture_cache_memory_limit_hard").let {
@@ -121,8 +117,8 @@ class SettingsSchemaTest {
         }
     }
 
-    /** Regression guard: every IntRange default must be in [min, max], else the slider
-     *  silently coerces the persisted default to a different value (the texture-cache bug). */
+    /** Every IntRange default must be in [min, max], else the slider silently coerces the
+     *  persisted default to a different value (the texture-cache bug). */
     @Test fun int_range_defaults_within_bounds() {
         SettingsSchema.allSettings.filterIsInstance<Setting.IntRange>().forEach {
             assert(it.default in it.min..it.max) {

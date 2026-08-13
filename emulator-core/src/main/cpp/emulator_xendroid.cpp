@@ -2,6 +2,7 @@
 #include "emulator_xendroid.h"
 #include "xendroid_emu.h"
 #include "xe_android_disc_swap.h"
+#include "xe_android_message_box.h"
 #include "xe_android_text_input.h"
 
 #include <atomic>   // single-xe::Memory-per-process guard in extract_xex_meta
@@ -1539,6 +1540,63 @@ static void j_keyboard_cancel_all(JNIEnv* env, jobject self) {
 #endif
 }
 
+static jobject j_msgbox_request(JNIEnv* env, jobject self) {
+#if XE_PLATFORM_xendroid
+    xendroid::PendingMessageBox req;
+    if (!xendroid::PeekMessageBoxRequest(req)) return nullptr;
+
+    jclass cls = env->FindClass("xendroid/compose/Emulator$MessageBoxRequest");
+    if (!cls) return nullptr;
+    jmethodID ctor = env->GetMethodID(cls, "<init>", "()V");
+    jobject o = env->NewObject(cls, ctor);
+    if (!o) return nullptr;
+
+    // UTF-16: the modified-UTF-8 accessors mangle guest strings.
+    auto set_string = [&](const char* field, const std::string& utf8) {
+        std::u16string u16 = xe::to_utf16(utf8);
+        jstring v = env->NewString(reinterpret_cast<const jchar*>(u16.data()),
+                                   (jsize)u16.size());
+        env->SetObjectField(o, env->GetFieldID(cls, field, "Ljava/lang/String;"), v);
+        env->DeleteLocalRef(v);
+    };
+
+    env->SetLongField(o, env->GetFieldID(cls, "id", "J"), (jlong)req.id);
+    set_string("title", req.title);
+    set_string("text", req.text);
+
+    jclass string_cls = env->FindClass("java/lang/String");
+    jobjectArray arr = env->NewObjectArray((jsize)req.buttons.size(), string_cls, nullptr);
+    for (size_t i = 0; i < req.buttons.size(); ++i) {
+        std::u16string u16 = xe::to_utf16(req.buttons[i]);
+        jstring v = env->NewString(reinterpret_cast<const jchar*>(u16.data()),
+                                   (jsize)u16.size());
+        env->SetObjectArrayElement(arr, (jsize)i, v);
+        env->DeleteLocalRef(v);
+    }
+    env->SetObjectField(o, env->GetFieldID(cls, "buttons", "[Ljava/lang/String;"), arr);
+    env->DeleteLocalRef(arr);
+
+    env->SetIntField(o, env->GetFieldID(cls, "activeButton", "I"),
+                     (jint)req.active_button);
+    env->SetIntField(o, env->GetFieldID(cls, "flags", "I"), (jint)req.flags);
+    return o;
+#else
+    return nullptr;
+#endif
+}
+
+static void j_msgbox_submit(JNIEnv* env, jobject self, jlong id, jint button) {
+#if XE_PLATFORM_xendroid
+    xendroid::SubmitMessageBox((uint64_t)id, (uint32_t)button);
+#endif
+}
+
+static void j_msgbox_cancel_all(JNIEnv* env, jobject self) {
+#if XE_PLATFORM_xendroid
+    xendroid::CancelAllMessageBox();
+#endif
+}
+
 static jobject j_disc_request(JNIEnv* env, jobject self) {
 #if XE_PLATFORM_xendroid
     xendroid::PendingDiscSwap req;
@@ -1665,6 +1723,9 @@ int register_xendroid_Emulator(JNIEnv* env){
             ,{"keyboard_request", "()Lxendroid/compose/Emulator$KeyboardRequest;", (void *) j_keyboard_request}
             ,{"keyboard_submit", "(JZLjava/lang/String;)V", (void *) j_keyboard_submit}
             ,{"keyboard_cancel_all", "()V", (void *) j_keyboard_cancel_all}
+            ,{"msgbox_request", "()Lxendroid/compose/Emulator$MessageBoxRequest;", (void *) j_msgbox_request}
+            ,{"msgbox_submit", "(JI)V", (void *) j_msgbox_submit}
+            ,{"msgbox_cancel_all", "()V", (void *) j_msgbox_cancel_all}
             ,{"disc_request", "()Lxendroid/compose/Emulator$DiscSwapRequest;", (void *) j_disc_request}
             ,{"disc_submit", "(JZLjava/lang/String;)V", (void *) j_disc_submit}
             ,{"disc_cancel_all", "()V", (void *) j_disc_cancel_all}
