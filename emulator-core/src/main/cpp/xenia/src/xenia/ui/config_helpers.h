@@ -317,7 +317,8 @@ GetKnownEnumOptions() {
         {"readback_resolve", {"fast", "some", "full", "none"}},
         {"render_target_path", {"performance", "accuracy"}},
         {"postprocess_antialiasing", {"off", "fxaa", "fxaa_extreme"}},
-        {"postprocess_scaling_and_sharpening", {"none", "cas", "fsr"}},
+        {"postprocess_scaling_and_sharpening",
+         {"none", "cas", "fsr", "sgsr", "sgsr_edge"}},
         {"spirv_version_override", {"auto", "1.0", "1.3", "1.4", "1.5", "1.6"}},
         {"xma_decoder", {"old", "new", "master", "fake"}},
     };

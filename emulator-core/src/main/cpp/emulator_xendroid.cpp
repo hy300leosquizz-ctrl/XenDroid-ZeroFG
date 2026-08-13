@@ -769,7 +769,8 @@ static const std::pair<std::string,entries> gen_list[]={
         //str
         {"APU|apu",{"nop","aaudio","opensles"}},
         {"Display|postprocess_antialiasing",{"none", "fxaa", "fxaa_extreme"}},
-        {"Display|postprocess_scaling_and_sharpening",{"bilinear", "cas", "fsr"}},
+        {"Display|postprocess_scaling_and_sharpening",
+                {"bilinear", "cas", "fsr", "sgsr", "sgsr_edge"}},
         {"GPU|gpu",{"vulkan", "null"}},
         {"GPU|render_target_path_vulkan",{"any", "fbo","fsi"}},
         {"HID|hid",{"android", "nop"}},

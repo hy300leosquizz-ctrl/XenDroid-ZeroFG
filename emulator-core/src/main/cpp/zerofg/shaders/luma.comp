@@ -1,0 +1,31 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D input_frame;
+
+layout(r8, set = 0, binding = 1) uniform writeonly image2D output_luma;
+
+layout(push_constant) uniform PushConstants {
+  uvec2 extent;
+} pc;
+
+void main() {
+  uvec2 pixel = gl_GlobalInvocationID.xy;
+
+  if (any(greaterThanEqual(pixel, pc.extent))) {
+    return;
+  }
+
+  vec3 rgb = texelFetch(input_frame, ivec2(pixel), 0).rgb;
+
+  float luma = dot(rgb, vec3(
+      0.2126,
+      0.7152,
+      0.0722));
+
+  imageStore(
+      output_luma,
+      ivec2(pixel),
+      vec4(luma, 0.0, 0.0, 1.0));
+}

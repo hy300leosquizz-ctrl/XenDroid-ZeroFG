@@ -119,7 +119,9 @@ object SettingsSchema {
             b("Display", "present_letterbox", "Present letterbox", true),
             b("Display", "postprocess_dither", "Postprocess dither", true),
             l("Display", "postprocess_scaling_and_sharpening", "Scaling & sharpening", "",
-                "bilinear" to "bilinear", "cas" to "cas", "fsr" to "fsr"),  // "" => bilinear (no selection)
+                "bilinear" to "bilinear", "cas" to "cas", "fsr" to "fsr",
+                "sgsr" to "SGSR1", "sgsr_edge" to "SGSR1 Edge Direction"),  // "" => bilinear (no selection)
+            b("Vulkan", "zerofg_frame_generation", "Frame Generation (ZeroFG)", false),
             b("Display", "present_render_pass_clear", "Present render-pass clear", true),
             l("Display", "postprocess_antialiasing", "Antialiasing", "",
                 "none" to "none", "fxaa" to "fxaa", "fxaa_extreme" to "fxaa_extreme"), // "" => none

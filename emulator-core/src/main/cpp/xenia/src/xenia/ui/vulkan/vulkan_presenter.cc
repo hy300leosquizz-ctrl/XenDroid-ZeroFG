@@ -9,6 +9,13 @@
 
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 
+#include "zerofg/zerofg.h"
+
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
+
 #include <cstdint>
 
 #include "xenia/base/assert.h"
@@ -51,6 +58,12 @@ DEFINE_bool(
     "may present with tearing if frames don't meet the host display refresh "
     "rate.",
     "Vulkan");
+
+DEFINE_bool(
+    zerofg_frame_generation, false,
+    "Enable ZeroFG frame generation. When disabled, ZeroFG GPU resources "
+    "are not initialized and presentation follows the normal Vulkan path.",
+    "Vulkan");
 #if XE_PLATFORM_MAC
 DEFINE_bool(vulkan_presenter_use_backing_scale, false,
             "Use the macOS view backing scale factor for MoltenVK drawables.",
@@ -72,8 +85,25 @@ namespace shaders {
 #include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_fsr_easu_ps.h"
 #include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_fsr_rcas_dither_ps.h"
 #include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_fsr_rcas_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_sgsr_edge_direction_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_sgsr_ps.h"
 #include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_triangle_strip_rect_vs.h"
 }  // namespace shaders
+
+VulkanPresenter::VulkanPresenter(
+    HostGpuLossCallback host_gpu_loss_callback,
+    VulkanDevice* vulkan_device,
+    const UISamplers* ui_samplers)
+    : Presenter(host_gpu_loss_callback),
+      vulkan_device_(vulkan_device),
+      ui_samplers_(ui_samplers),
+      guest_output_image_refresher_completion_timeline_(
+          vulkan_device, "guest-refresher"),
+      ui_completion_timeline_(vulkan_device, "ui"),
+      paint_context_(vulkan_device) {
+  assert_not_null(vulkan_device);
+  assert_not_null(ui_samplers);
+}
 
 VulkanPresenter::PaintContext::Submission::~Submission() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
@@ -153,6 +183,16 @@ VulkanPresenter::~VulkanPresenter() {
   // just one sleep will likely be needed.
   ui_completion_timeline_.AwaitAllSubmissions();
   guest_output_image_refresher_completion_timeline_.AwaitAllSubmissions();
+
+  // All work that could reference ZeroFG resources has completed.
+  zerofg_previous_real_image_.reset();
+  for (ZeroFGSubmissionRefs& refs : zerofg_submission_refs_) {
+    refs = {};
+  }
+  for (std::shared_ptr<GuestOutputImage>& image : zerofg_synthetic_images_) {
+    image.reset();
+  }
+  zerofg_interpolator_.reset();
 
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
@@ -1295,7 +1335,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // interfering with GPU command processing, and also to allow tearing so
   // variable refresh rate may be used where it's available.
   // Note: If the priorities here are changes, update the cvar descriptions.
-  if (cvars::vulkan_allow_present_mode_immediate &&
+  // ZeroFG bring-up requires deterministic FIFO ordering so the synthetic
+  // midpoint cannot be silently replaced by the following real frame in
+  // Mailbox or Immediate presentation.
+  if (cvars::zerofg_frame_generation) {
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+  } else if (cvars::vulkan_allow_present_mode_immediate &&
       std::find(present_modes.cbegin(), present_modes.cend(),
                 VK_PRESENT_MODE_IMMEDIATE_KHR) != present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
@@ -1430,7 +1475,7 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_create_info.usage =
-      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
@@ -1484,6 +1529,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
   const PaintContext::Submission& paint_submission =
       *paint_context_.submissions[current_paint_submission_index %
                                   paint_submission_count];
+
+  const uint32_t zerofg_context_index =
+      uint32_t(current_paint_submission_index % paint_submission_count);
+
+  if (zerofg_interpolator_) {
+    // The corresponding paint submission has completed before this slot is
+    // reused, so references retained for its previous ZeroFG work can go.
+    zerofg_submission_refs_[zerofg_context_index] = {};
+  }
 
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
@@ -1591,7 +1645,22 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
   GuestOutputProperties guest_output_properties;
   GuestOutputPaintConfig guest_output_paint_config;
   std::shared_ptr<GuestOutputImage> guest_output_image;
-  {
+
+  bool zerofg_pending_real_paint = false;
+  bool zerofg_schedule_real_after_present = false;
+
+  if (zerofg_interpolator_ && zerofg_pending_real_image_) {
+    // This is the second half of S -> B. Do not touch the mailbox here:
+    // a newer real frame C may already be waiting there.
+    guest_output_image = zerofg_pending_real_image_;
+    zerofg_pending_real_image_.reset();
+
+    guest_output_properties = zerofg_pending_real_properties_;
+    guest_output_paint_config = zerofg_pending_real_paint_config_;
+
+    zerofg_pending_real_paint = true;
+    ++zerofg_cadence_secondary_real_count_;
+  } else {
     uint32_t guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(
         ConsumeGuestOutput(guest_output_mailbox_index, &guest_output_properties,
@@ -1606,6 +1675,315 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     // the consumer critical section now as everything here either will be using
     // the new reference or is exclusively owned by main target painting (and
     // multiple threads can't paint the main target at the same time).
+  }
+
+  if (zerofg_interpolator_ && guest_output_image) {
+    ++zerofg_cadence_paint_count_;
+
+    if (!zerofg_pending_real_paint) {
+      const VkImage current_real_handle = guest_output_image->image();
+
+      if (current_real_handle != zerofg_cadence_last_real_image_) {
+        ++zerofg_cadence_new_real_count_;
+        zerofg_cadence_last_real_image_ = current_real_handle;
+      } else {
+        ++zerofg_cadence_repeat_real_count_;
+      }
+    }
+
+    if ((zerofg_cadence_paint_count_ % 120) == 0) {
+#if defined(__ANDROID__)
+      __android_log_print(
+          ANDROID_LOG_INFO,
+          "ZeroFG",
+          "CADENCE paints=%llu new_real=%llu repeats=%llu synth=%llu secondary=%llu drops=%llu fifo=%u",
+          static_cast<unsigned long long>(zerofg_cadence_paint_count_),
+          static_cast<unsigned long long>(zerofg_cadence_new_real_count_),
+          static_cast<unsigned long long>(zerofg_cadence_repeat_real_count_),
+          static_cast<unsigned long long>(zerofg_cadence_synth_count_),
+          static_cast<unsigned long long>(
+              zerofg_cadence_secondary_real_count_),
+          static_cast<unsigned long long>(
+              zerofg_cadence_secondary_drop_count_),
+          paint_context_.swapchain_is_fifo ? 1u : 0u);
+#endif
+    }
+  }
+
+  // ZeroFG first functional interpolation.
+  //
+  // This smoke-test path still produces one host presentation per normal
+  // presenter invocation. Once two distinct real frames A and B are known,
+  // it generates the midpoint S(A,B) and presents S instead of B.
+  //
+  // A real A -> S -> B presentation cadence is a later step.
+  if (zerofg_interpolator_ && !zerofg_runtime_failed_ &&
+      guest_output_image && !zerofg_pending_real_paint) {
+    const std::shared_ptr<GuestOutputImage> zerofg_current_real_image =
+        guest_output_image;
+    const VkExtent2D zerofg_current_extent =
+        zerofg_current_real_image->extent();
+
+    const bool zerofg_resize_needed =
+        zerofg_width_ != zerofg_current_extent.width ||
+        zerofg_height_ != zerofg_current_extent.height ||
+        zerofg_format_ != kGuestOutputFormat;
+
+    if (zerofg_resize_needed) {
+      // Resize reallocates ZeroFG scratch resources for all frame contexts.
+      // If ZeroFG has already been used, ensure none of those resources are
+      // still referenced by an older paint submission.
+      if (zerofg_width_ || zerofg_height_) {
+        paint_context_.completion_timeline.AwaitAllSubmissions();
+      }
+
+      for (ZeroFGSubmissionRefs& refs : zerofg_submission_refs_) {
+        refs = {};
+      }
+
+      zerofg_previous_real_image_.reset();
+      zerofg_pending_real_image_.reset();
+
+      for (size_t i = 0; i < zerofg_synthetic_images_.size(); ++i) {
+        zerofg_synthetic_images_[i].reset();
+        zerofg_synthetic_layout_initialized_[i] = false;
+      }
+
+      const zerofg::Status resize_status =
+          zerofg_interpolator_->Resize(
+              zerofg_current_extent.width,
+              zerofg_current_extent.height,
+              kGuestOutputFormat,
+              kGuestOutputFormat);
+
+      if (resize_status != zerofg::Status::kSuccess) {
+        XELOGE(
+            "ZeroFG: Resize failed with status {}; disabling frame "
+            "generation for this session",
+            static_cast<uint32_t>(resize_status));
+
+#if defined(__ANDROID__)
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            "ZeroFG",
+            "Resize failed status=%u; disabling for session",
+            static_cast<unsigned>(resize_status));
+#endif
+
+        zerofg_runtime_failed_ = true;
+      } else {
+        zerofg_width_ = zerofg_current_extent.width;
+        zerofg_height_ = zerofg_current_extent.height;
+        zerofg_format_ = kGuestOutputFormat;
+
+        XELOGI(
+            "ZeroFG: resized interpolation resources to {}x{} format {}",
+            zerofg_width_,
+            zerofg_height_,
+            static_cast<uint32_t>(zerofg_format_));
+      }
+    }
+
+    if (!zerofg_runtime_failed_) {
+      const std::shared_ptr<GuestOutputImage> zerofg_previous_real_image =
+          zerofg_previous_real_image_;
+
+      const bool zerofg_have_frame_pair =
+          zerofg_previous_real_image &&
+          zerofg_previous_real_image != zerofg_current_real_image &&
+          zerofg_previous_real_image->extent().width ==
+              zerofg_current_extent.width &&
+          zerofg_previous_real_image->extent().height ==
+              zerofg_current_extent.height;
+
+      if (zerofg_have_frame_pair) {
+        std::shared_ptr<GuestOutputImage>& zerofg_synthetic_image =
+            zerofg_synthetic_images_[zerofg_context_index];
+
+        if (!zerofg_synthetic_image ||
+            zerofg_synthetic_image->extent().width !=
+                zerofg_current_extent.width ||
+            zerofg_synthetic_image->extent().height !=
+                zerofg_current_extent.height) {
+          std::unique_ptr<GuestOutputImage> new_synthetic_image =
+              GuestOutputImage::Create(
+                  vulkan_device_,
+                  zerofg_current_extent.width,
+                  zerofg_current_extent.height);
+
+          if (!new_synthetic_image) {
+            XELOGE(
+                "ZeroFG: failed to allocate synthetic guest output image; "
+                "disabling frame generation for this session");
+
+#if defined(__ANDROID__)
+            __android_log_print(
+                ANDROID_LOG_ERROR,
+                "ZeroFG",
+                "Failed to allocate synthetic output image");
+#endif
+
+            zerofg_runtime_failed_ = true;
+          } else {
+            zerofg_synthetic_image =
+                std::shared_ptr<GuestOutputImage>(
+                    std::move(new_synthetic_image));
+            zerofg_synthetic_layout_initialized_[zerofg_context_index] =
+                false;
+          }
+        }
+
+        if (!zerofg_runtime_failed_) {
+          // GuestOutputImage starts in VK_IMAGE_LAYOUT_UNDEFINED. ZeroFG
+          // deliberately rejects undefined external layouts, so establish the
+          // normal presenter internal layout once before the image's first use.
+          if (!zerofg_synthetic_layout_initialized_
+                   [zerofg_context_index]) {
+            VkImageMemoryBarrier synthetic_initial_barrier{};
+            synthetic_initial_barrier.sType =
+                VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            synthetic_initial_barrier.srcAccessMask = 0;
+            synthetic_initial_barrier.dstAccessMask =
+                kGuestOutputInternalAccessMask;
+            synthetic_initial_barrier.oldLayout =
+                VK_IMAGE_LAYOUT_UNDEFINED;
+            synthetic_initial_barrier.newLayout =
+                kGuestOutputInternalLayout;
+            synthetic_initial_barrier.srcQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            synthetic_initial_barrier.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            synthetic_initial_barrier.image =
+                zerofg_synthetic_image->image();
+            synthetic_initial_barrier.subresourceRange.aspectMask =
+                VK_IMAGE_ASPECT_COLOR_BIT;
+            synthetic_initial_barrier.subresourceRange.baseMipLevel = 0;
+            synthetic_initial_barrier.subresourceRange.levelCount = 1;
+            synthetic_initial_barrier.subresourceRange.baseArrayLayer = 0;
+            synthetic_initial_barrier.subresourceRange.layerCount = 1;
+
+            dfn.vkCmdPipelineBarrier(
+                draw_command_buffer,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                kGuestOutputInternalStageMask,
+                0,
+                0,
+                nullptr,
+                0,
+                nullptr,
+                1,
+                &synthetic_initial_barrier);
+
+            zerofg_synthetic_layout_initialized_
+                [zerofg_context_index] = true;
+          }
+
+          constexpr VkImageUsageFlags kZeroFGGuestOutputUsage =
+              VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+              VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+              VK_IMAGE_USAGE_SAMPLED_BIT |
+              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+              VK_IMAGE_USAGE_STORAGE_BIT;
+
+          const auto make_zerofg_image =
+              [](const std::shared_ptr<GuestOutputImage>& image)
+                  -> zerofg::Image {
+            zerofg::Image result;
+            result.image = image->image();
+            result.view = image->view();
+            result.layout = kGuestOutputInternalLayout;
+            result.format = kGuestOutputFormat;
+            result.width = image->extent().width;
+            result.height = image->extent().height;
+            result.usage = kZeroFGGuestOutputUsage;
+            return result;
+          };
+
+          ZeroFGSubmissionRefs& submission_refs =
+              zerofg_submission_refs_[zerofg_context_index];
+
+          submission_refs.previous = zerofg_previous_real_image;
+          submission_refs.current = zerofg_current_real_image;
+          submission_refs.output = zerofg_synthetic_image;
+
+          const zerofg::Image previous_image =
+              make_zerofg_image(zerofg_previous_real_image);
+          const zerofg::Image current_image =
+              make_zerofg_image(zerofg_current_real_image);
+          const zerofg::Image output_image =
+              make_zerofg_image(zerofg_synthetic_image);
+
+          const zerofg::Status interpolate_status =
+              zerofg_interpolator_->Interpolate(
+                  draw_command_buffer,
+                  zerofg_context_index,
+                  previous_image,
+                  current_image,
+                  0.5f,
+                  output_image);
+
+          if (interpolate_status == zerofg::Status::kSuccess) {
+            ++zerofg_cadence_synth_count_;
+
+            // From this point onward, let the existing presenter treat the
+            // synthetic image exactly like a normal guest output image.
+            guest_output_image = zerofg_synthetic_image;
+
+            // S is being painted by this submission. Retain the corresponding
+            // real B so it can be painted immediately afterwards without
+            // consuming a newer real C from the guest-output mailbox.
+            zerofg_pending_real_image_ = zerofg_current_real_image;
+            zerofg_pending_real_properties_ = guest_output_properties;
+            zerofg_pending_real_paint_config_ = guest_output_paint_config;
+            zerofg_schedule_real_after_present = true;
+
+            if (!zerofg_first_interpolation_logged_) {
+              zerofg_first_interpolation_logged_ = true;
+
+              XELOGI(
+                  "ZeroFG: first synthetic midpoint frame recorded "
+                  "successfully ({}x{}, context {})",
+                  zerofg_width_,
+                  zerofg_height_,
+                  zerofg_context_index);
+
+#if defined(__ANDROID__)
+              __android_log_print(
+                  ANDROID_LOG_INFO,
+                  "ZeroFG",
+                  "FIRST SYNTH SUCCESS %ux%u context=%u",
+                  zerofg_width_,
+                  zerofg_height_,
+                  zerofg_context_index);
+#endif
+            }
+          } else {
+            // Interpolate may already have recorded commands before a Vulkan
+            // failure. Keep all submission_refs alive until this paint slot is
+            // known to have completed, but fall back visually to real frame B.
+            XELOGE(
+                "ZeroFG: Interpolate failed with status {}; disabling frame "
+                "generation for this session",
+                static_cast<uint32_t>(interpolate_status));
+
+#if defined(__ANDROID__)
+            __android_log_print(
+                ANDROID_LOG_ERROR,
+                "ZeroFG",
+                "Interpolate failed status=%u context=%u",
+                static_cast<unsigned>(interpolate_status),
+                zerofg_context_index);
+#endif
+
+            zerofg_runtime_failed_ = true;
+          }
+        }
+      }
+
+      // Temporal history always advances using REAL frames only. Never feed a
+      // generated S back as the next previous frame.
+      zerofg_previous_real_image_ = zerofg_current_real_image;
+    }
   }
 
   if (guest_output_image) {
@@ -1981,6 +2359,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
             CasResampleConstants cas_resample;
             FsrEasuConstants fsr_easu;
             FsrRcasConstants fsr_rcas;
+            SgsrConstants sgsr;
           } effect_constants;
           switch (guest_output_paint_pipeline_layout_index) {
             case kGuestOutputPaintPipelineLayoutIndexBilinear: {
@@ -2005,6 +2384,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
               effect_constants_size = sizeof(effect_constants.fsr_rcas);
               effect_constants.fsr_rcas.Initialize(guest_output_flow, i,
                                                    guest_output_paint_config);
+            } break;
+            case kGuestOutputPaintPipelineLayoutIndexSgsr: {
+              effect_constants_size = sizeof(effect_constants.sgsr);
+              effect_constants.sgsr.Initialize(guest_output_flow, i);
             } break;
             default:
               break;
@@ -2215,8 +2598,44 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
   }
   switch (present_result) {
     case VK_SUCCESS:
+      if (zerofg_schedule_real_after_present &&
+          zerofg_pending_real_image_) {
+        // This recursively enters only the Vulkan implementation, not the
+        // public Presenter lock. The pending-real branch above consumes B and
+        // cannot schedule another interpolation, so recursion depth is one.
+        PaintResult secondary_result = PaintAndPresentImpl(false);
+
+        if (secondary_result == PaintResult::kGpuLostResponsible ||
+            secondary_result ==
+                PaintResult::kNotPresentedConnectionOutdated) {
+          return secondary_result;
+        }
+
+        if (secondary_result != PaintResult::kPresented &&
+            secondary_result != PaintResult::kPresentedSuboptimal) {
+          zerofg_pending_real_image_.reset();
+          ++zerofg_cadence_secondary_drop_count_;
+        }
+      }
       return PaintResult::kPresented;
+
     case VK_SUBOPTIMAL_KHR:
+      if (zerofg_schedule_real_after_present &&
+          zerofg_pending_real_image_) {
+        PaintResult secondary_result = PaintAndPresentImpl(false);
+
+        if (secondary_result == PaintResult::kGpuLostResponsible ||
+            secondary_result ==
+                PaintResult::kNotPresentedConnectionOutdated) {
+          return secondary_result;
+        }
+
+        if (secondary_result != PaintResult::kPresented &&
+            secondary_result != PaintResult::kPresentedSuboptimal) {
+          zerofg_pending_real_image_.reset();
+          ++zerofg_cadence_secondary_drop_count_;
+        }
+      }
       return PaintResult::kPresentedSuboptimal;
     case VK_ERROR_DEVICE_LOST:
       XELOGE(
@@ -2250,8 +2669,45 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
 }
 
 bool VulkanPresenter::InitializeSurfaceIndependent() {
+
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
+
+  if (cvars::zerofg_frame_generation) {
+    // ZeroFG uses the exact Vulkan instance / loader path owned by Xenia.
+    const VulkanInstance* const vulkan_instance =
+        vulkan_device_->vulkan_instance();
+    const VulkanInstance::Functions& ifn =
+        vulkan_instance->functions();
+
+    zerofg::CreateInfo zerofg_create_info;
+    zerofg_create_info.vulkan.instance =
+        vulkan_instance->instance();
+    zerofg_create_info.vulkan.physical_device =
+        vulkan_device_->physical_device();
+    zerofg_create_info.vulkan.device = device;
+    zerofg_create_info.vulkan.get_instance_proc_addr =
+        ifn.vkGetInstanceProcAddr;
+    zerofg_create_info.vulkan.allocator = nullptr;
+    zerofg_create_info.frame_context_count =
+        PaintContext::kSubmissionCount;
+
+    zerofg::Status zerofg_status = zerofg::Status::kSuccess;
+    zerofg_interpolator_ =
+        zerofg::Interpolator::Create(
+            zerofg_create_info, &zerofg_status);
+
+    if (zerofg_interpolator_) {
+      XELOGI(
+          "ZeroFG: interpolator initialized with {} frame contexts",
+          PaintContext::kSubmissionCount);
+    } else {
+      XELOGE(
+          "ZeroFG: interpolator initialization failed with status {} - "
+          "presentation will continue without ZeroFG",
+          static_cast<uint32_t>(zerofg_status));
+    }
+  }
 
   VkDescriptorSetLayoutBinding guest_output_image_sampler_bindings[2];
   guest_output_image_sampler_bindings[0].binding = 0;
@@ -2337,6 +2793,10 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
       case kGuestOutputPaintPipelineLayoutIndexFsrRcas:
         guest_output_paint_push_constant_range_ffx.size =
             sizeof(FsrRcasConstants);
+        break;
+      case kGuestOutputPaintPipelineLayoutIndexSgsr:
+        guest_output_paint_push_constant_range_ffx.size =
+            sizeof(SgsrConstants);
         break;
       default:
         assert_unhandled_case(GuestOutputPaintPipelineLayoutIndex(i));
@@ -2426,6 +2886,17 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         shader_module_create_info.pCode =
             shaders::guest_output_ffx_fsr_rcas_dither_ps;
         break;
+      case GuestOutputPaintEffect::kSgsr:
+        shader_module_create_info.codeSize =
+            sizeof(shaders::guest_output_sgsr_ps);
+        shader_module_create_info.pCode = shaders::guest_output_sgsr_ps;
+            break;
+      case GuestOutputPaintEffect::kSgsrEdgeDirection:
+        shader_module_create_info.codeSize =
+            sizeof(shaders::guest_output_sgsr_edge_direction_ps);
+        shader_module_create_info.pCode =
+            shaders::guest_output_sgsr_edge_direction_ps;
+            break;
       default:
         // Not supported by this implementation.
         continue;

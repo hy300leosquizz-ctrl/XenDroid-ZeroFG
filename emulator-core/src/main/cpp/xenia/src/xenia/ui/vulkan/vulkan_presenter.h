@@ -26,6 +26,10 @@
 #include "xenia/ui/vulkan/vulkan_gpu_completion_timeline.h"
 #include "xenia/ui/vulkan/vulkan_instance.h"
 
+namespace zerofg {
+class Interpolator;
+}
+
 namespace xe {
 namespace ui {
 namespace vulkan {
@@ -252,6 +256,7 @@ class VulkanPresenter final : public Presenter {
     kGuestOutputPaintPipelineLayoutIndexCasResample,
     kGuestOutputPaintPipelineLayoutIndexFsrEasu,
     kGuestOutputPaintPipelineLayoutIndexFsrRcas,
+    kGuestOutputPaintPipelineLayoutIndexSgsr,
 
     kGuestOutputPaintPipelineLayoutCount,
   };
@@ -273,6 +278,9 @@ class VulkanPresenter final : public Presenter {
       case GuestOutputPaintEffect::kFsrRcas:
       case GuestOutputPaintEffect::kFsrRcasDither:
         return kGuestOutputPaintPipelineLayoutIndexFsrRcas;
+      case GuestOutputPaintEffect::kSgsr:
+      case GuestOutputPaintEffect::kSgsrEdgeDirection:
+        return kGuestOutputPaintPipelineLayoutIndexSgsr;
       default:
         assert_unhandled_case(effect);
         return kGuestOutputPaintPipelineLayoutCount;
@@ -444,19 +452,10 @@ class VulkanPresenter final : public Presenter {
     std::vector<VkSemaphore> swapchain_image_present_semaphores;
   };
 
-  explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
-                           VulkanDevice* vulkan_device,
-                           const UISamplers* ui_samplers)
-      : Presenter(host_gpu_loss_callback),
-        vulkan_device_(vulkan_device),
-        ui_samplers_(ui_samplers),
-        guest_output_image_refresher_completion_timeline_(vulkan_device,
-                                                          "guest-refresher"),
-        ui_completion_timeline_(vulkan_device, "ui"),
-        paint_context_(vulkan_device) {
-    assert_not_null(vulkan_device);
-    assert_not_null(ui_samplers);
-  }
+  explicit VulkanPresenter(
+      HostGpuLossCallback host_gpu_loss_callback,
+      VulkanDevice* vulkan_device,
+      const UISamplers* ui_samplers);
 
   bool InitializeSurfaceIndependent();
 
@@ -465,6 +464,52 @@ class VulkanPresenter final : public Presenter {
 
   VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
+
+  // ZeroFG interpolation engine. It does not own the queue or presentation.
+  std::unique_ptr<zerofg::Interpolator> zerofg_interpolator_;
+
+  // ZeroFG temporal state. The real previous/current frames and the synthetic
+  // output used by a paint submission must remain alive until that submission
+  // has completed on the GPU.
+  struct ZeroFGSubmissionRefs {
+    std::shared_ptr<GuestOutputImage> previous;
+    std::shared_ptr<GuestOutputImage> current;
+    std::shared_ptr<GuestOutputImage> output;
+  };
+
+  std::shared_ptr<GuestOutputImage> zerofg_previous_real_image_;
+
+  std::array<std::shared_ptr<GuestOutputImage>,
+             PaintContext::kSubmissionCount>
+      zerofg_synthetic_images_;
+
+  std::array<bool, PaintContext::kSubmissionCount>
+      zerofg_synthetic_layout_initialized_ = {};
+
+  std::array<ZeroFGSubmissionRefs, PaintContext::kSubmissionCount>
+      zerofg_submission_refs_;
+
+  uint32_t zerofg_width_ = 0;
+  uint32_t zerofg_height_ = 0;
+  VkFormat zerofg_format_ = VK_FORMAT_UNDEFINED;
+
+  bool zerofg_runtime_failed_ = false;
+  bool zerofg_first_interpolation_logged_ = false;
+
+  // Temporary cadence diagnostics for bringing up true 2x presentation.
+  uint64_t zerofg_cadence_paint_count_ = 0;
+  uint64_t zerofg_cadence_new_real_count_ = 0;
+  uint64_t zerofg_cadence_repeat_real_count_ = 0;
+  uint64_t zerofg_cadence_synth_count_ = 0;
+  uint64_t zerofg_cadence_secondary_real_count_ = 0;
+  uint64_t zerofg_cadence_secondary_drop_count_ = 0;
+  VkImage zerofg_cadence_last_real_image_ = VK_NULL_HANDLE;
+
+  // When S(A,B) has been presented, B is retained here for an immediate
+  // second paint/present without consuming a newer mailbox image C.
+  std::shared_ptr<GuestOutputImage> zerofg_pending_real_image_;
+  GuestOutputProperties zerofg_pending_real_properties_;
+  GuestOutputPaintConfig zerofg_pending_real_paint_config_;
 
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage

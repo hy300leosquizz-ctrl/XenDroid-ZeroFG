@@ -469,6 +469,7 @@ endif()
 # ==============================================================================
 
 add_subdirectory(third_party)
+add_subdirectory(../zerofg zerofg)
 
 add_subdirectory(src/xenia)
 

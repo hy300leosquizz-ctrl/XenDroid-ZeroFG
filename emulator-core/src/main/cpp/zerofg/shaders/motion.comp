@@ -1,0 +1,101 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, r8) uniform readonly image2D previous_luma;
+layout(set = 0, binding = 1, r8) uniform readonly image2D current_luma;
+layout(set = 0, binding = 2, rgba32f) uniform writeonly image2D motion_out;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 extent;
+} pc;
+
+const int kBlockSize = 8;
+const int kSearchRadius = 4;
+
+float ReadPreviousLuma(ivec2 p) {
+    ivec2 hi = ivec2(pc.extent) - ivec2(1);
+    return imageLoad(
+        previous_luma,
+        clamp(p, ivec2(0), hi)).r;
+}
+
+float ReadCurrentLuma(ivec2 p) {
+    ivec2 hi = ivec2(pc.extent) - ivec2(1);
+    return imageLoad(
+        current_luma,
+        clamp(p, ivec2(0), hi)).r;
+}
+
+void main() {
+    ivec2 block = ivec2(gl_GlobalInvocationID.xy);
+
+    ivec2 block_count =
+        (ivec2(pc.extent) + ivec2(kBlockSize - 1)) /
+        kBlockSize;
+
+    if (any(greaterThanEqual(block, block_count))) {
+        return;
+    }
+
+    ivec2 base = block * kBlockSize;
+
+    float best_cost = 3.402823466e+38;
+    float second_cost = 3.402823466e+38;
+    ivec2 best_motion = ivec2(0);
+
+    for (int dy = -kSearchRadius; dy <= kSearchRadius; ++dy) {
+        for (int dx = -kSearchRadius; dx <= kSearchRadius; ++dx) {
+            ivec2 motion = ivec2(dx, dy);
+
+            float sad = 0.0;
+            int sample_count = 0;
+
+            // 4x4 sampling grid inside each 8x8 block.
+            for (int sy = 0; sy < kBlockSize; sy += 2) {
+                for (int sx = 0; sx < kBlockSize; sx += 2) {
+                    ivec2 current_pos = base + ivec2(sx, sy);
+
+                    if (current_pos.x >= int(pc.extent.x) ||
+                        current_pos.y >= int(pc.extent.y)) {
+                        continue;
+                    }
+
+                    float c =
+                        ReadCurrentLuma(current_pos);
+
+                    // Positive motion means previous -> current.
+                    float p =
+                        ReadPreviousLuma(
+                            current_pos - motion);
+
+                    sad += abs(c - p);
+                    ++sample_count;
+                }
+            }
+
+            float cost =
+                sad / max(float(sample_count), 1.0);
+
+            if (cost < best_cost) {
+                second_cost = best_cost;
+                best_cost = cost;
+                best_motion = motion;
+            } else if (cost < second_cost) {
+                second_cost = cost;
+            }
+        }
+    }
+
+    float confidence =
+        (second_cost - best_cost) /
+        max(second_cost, 0.00001);
+
+    imageStore(
+        motion_out,
+        block,
+        vec4(
+            vec2(best_motion),
+            best_cost,
+            clamp(confidence, 0.0, 1.0)));
+}

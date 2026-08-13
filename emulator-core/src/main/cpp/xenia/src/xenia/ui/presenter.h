@@ -201,6 +201,8 @@ class Presenter {
       // AMD FidelityFX Super Resolution upsampling, Contrast Adaptive
       // Sharpening otherwise.
       kFsr,
+      kSgsr,
+      kSgsrEdgeDirection,
     };
 
     // This value is used as a lerp factor.
@@ -404,6 +406,8 @@ class Presenter {
     kFsrEasu,
     kFsrRcas,
     kFsrRcasDither,
+    kSgsr,
+    kSgsrEdgeDirection,
 
     kCount,
   };
@@ -552,6 +556,33 @@ class Presenter {
           float(input_height) / float(output_size.second);
       sharpness_post_setup =
           CalculateCasPostSetupSharpness(config.GetCasAdditionalSharpness());
+    }
+  };
+
+  struct SgsrConstants {
+    int32_t output_offset[2];
+    float output_size_inv[2];
+    float input_size_inv[2];
+    float input_size[2];
+
+    void Initialize(const GuestOutputPaintFlow& flow, size_t effect_index) {
+      flow.GetEffectOutputOffset(effect_index, output_offset[0],
+                                 output_offset[1]);
+
+      uint32_t input_width, input_height;
+      flow.GetEffectInputSize(effect_index, input_width, input_height);
+
+      const std::pair<uint32_t, uint32_t>& output_size =
+            flow.effect_output_sizes[effect_index];
+
+      output_size_inv[0] = 1.0f / float(output_size.first);
+      output_size_inv[1] = 1.0f / float(output_size.second);
+
+      input_size_inv[0] = 1.0f / float(input_width);
+      input_size_inv[1] = 1.0f / float(input_height);
+
+      input_size[0] = float(input_width);
+      input_size[1] = float(input_height);
     }
   };
 

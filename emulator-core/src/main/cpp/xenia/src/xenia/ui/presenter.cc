@@ -853,6 +853,29 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   uint32_t output_width_clamped = std::min(output_width, max_rt_width);
   uint32_t output_height_clamped = std::min(output_height, max_rt_height);
 
+  if (config.GetEffect() == GuestOutputPaintConfig::Effect::kSgsr ||
+      config.GetEffect() ==
+        GuestOutputPaintConfig::Effect::kSgsrEdgeDirection) {
+    uint32_t input_width, input_height;
+    if (flow.effect_count) {
+      input_width = flow.effect_output_sizes[flow.effect_count - 1].first;
+      input_height = flow.effect_output_sizes[flow.effect_count - 1].second;
+    } else {
+      input_width = properties.frontbuffer_width;
+      input_height = properties.frontbuffer_height;
+    }
+
+    if (input_width < output_width || input_height < output_height) {
+      assert_true(flow.effect_count < flow.effects.size());
+      flow.effect_output_sizes[flow.effect_count] =
+          std::make_pair(output_width, output_height);
+      flow.effects[flow.effect_count++] =
+          config.GetEffect() == GuestOutputPaintConfig::Effect::kSgsr
+              ? GuestOutputPaintEffect::kSgsr
+              : GuestOutputPaintEffect::kSgsrEdgeDirection;
+    }
+  }
+
   if (config.GetEffect() == GuestOutputPaintConfig::Effect::kCas ||
       config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr) {
     // FidelityFX Super Resolution and Contrast Adaptive Sharpening only work
