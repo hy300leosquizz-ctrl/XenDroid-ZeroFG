@@ -19,6 +19,12 @@
 #include "xenia/ui/gpu_completion_timeline.h"
 #include "xenia/ui/vulkan/vulkan_device.h"
 
+// Host timing of completion waits, queue locks and submits: a development
+// diagnostic, compiled out of the release.
+namespace cvars {
+inline constexpr bool vulkan_completion_wait_telemetry = false;
+}  // namespace cvars
+
 namespace xe {
 namespace ui {
 namespace vulkan {
@@ -87,6 +93,7 @@ class VulkanGPUCompletionTimeline : public GPUCompletionTimeline {
         } else {
           completion_timeline_->free_fences_.push_back(fence_);
         }
+        completion_timeline_->RecordFenceCounts();
       }
     }
 
@@ -126,21 +133,91 @@ class VulkanGPUCompletionTimeline : public GPUCompletionTimeline {
 
   VkResult AcquireFenceAndSubmit(uint32_t queue_family_index,
                                  uint32_t queue_index, uint32_t submit_count,
-                                 const VkSubmitInfo* submits);
+                                 const VkSubmitInfo* submits,
+                                 uint64_t* queue_lock_wait_ns_out = nullptr,
+                                 uint64_t* submit_host_ns_out = nullptr);
+
+  // Some owners (currently the command processor) have an explicit
+  // frame-in-flight wait that is the authority for fence reuse. They may opt
+  // in to skipping opportunistic pending-fence status polls, using the
+  // explicit oldest-fence wait only at the storage safety cap.
+  void SetNoPendingReclaimPoll(bool enabled) {
+    no_pending_reclaim_poll_ = enabled;
+  }
 
   void UpdateCompletedSubmission() override;
 
  protected:
   void AwaitSubmissionImpl(uint64_t awaited_submission) override;
+  bool CompletionPollMayBlock() const override;
 
  private:
+  struct Telemetry {
+    uint64_t interval_start_ns = 0;
+
+    uint64_t update_calls = 0;
+    uint64_t update_total_ns = 0;
+    uint64_t update_max_ns = 0;
+    size_t last_update_pending_before = 0;
+    uint64_t status_calls = 0;
+    uint64_t status_total_ns = 0;
+    uint64_t status_max_ns = 0;
+    uint64_t status_over_1ms = 0;
+    uint64_t status_over_4ms = 0;
+    uint64_t retired_fences = 0;
+
+    uint64_t wait_calls = 0;
+    uint64_t wait_total_ns = 0;
+    uint64_t wait_max_ns = 0;
+    uint64_t wait_over_1ms = 0;
+    uint64_t wait_over_4ms = 0;
+    uint64_t reclaim_wait_calls = 0;
+    uint64_t last_awaited_submission = 0;
+    uint64_t last_wait_front_submission = 0;
+    uint64_t last_wait_tail_submission = 0;
+    size_t last_wait_pending = 0;
+
+    uint64_t acquire_calls = 0;
+    uint64_t acquire_total_ns = 0;
+    uint64_t acquire_max_ns = 0;
+    uint64_t acquire_over_1ms = 0;
+    uint64_t acquire_over_4ms = 0;
+    size_t last_acquire_pending_before = 0;
+    size_t last_acquire_free_before = 0;
+
+    uint64_t queue_lock_calls = 0;
+    uint64_t queue_lock_total_ns = 0;
+    uint64_t queue_lock_max_ns = 0;
+    uint64_t queue_lock_over_1ms = 0;
+    uint64_t queue_lock_over_4ms = 0;
+    uint64_t submit_calls = 0;
+    uint64_t submit_total_ns = 0;
+    uint64_t submit_max_ns = 0;
+    uint64_t submit_over_1ms = 0;
+    uint64_t submit_over_4ms = 0;
+
+    size_t pending_high_water = 0;
+    size_t free_high_water = 0;
+  };
+
+  static uint64_t TelemetryNowNs();
+  static void AddTimedOperation(uint64_t duration_ns, uint64_t& calls,
+                                uint64_t& total_ns, uint64_t& max_ns,
+                                uint64_t& over_1ms, uint64_t& over_4ms);
+  void RecordFenceCounts();
+  void MaybeLogTelemetry();
+  bool WaitForOldestPendingFence();
+
   VulkanDevice* const vulkan_device_;
   const char* const name_;
+  bool no_pending_reclaim_poll_ = false;
 
   std::vector<VkFence> free_fences_;
 
   // <Submission index, fence>, in submission index order.
   std::deque<std::pair<uint64_t, VkFence>> pending_submission_fences_;
+
+  Telemetry telemetry_;
 
 #ifndef NDEBUG
   size_t fences_acquired_ = 0;

@@ -82,9 +82,13 @@ public class Application extends android.app.Application{
             File f=new File(get_app_data_dir(),e);
             f.mkdirs();
         }
+        // Refresh, not just create: it is a cache of the bundled asset, and the
+        // settings UI diffs against it to decide what is modified from default.
         File default_config_file=get_default_config_file();
-        if(!default_config_file.exists())
-            Utils.save_string(default_config_file,load_default_config_str(this));
+        String bundled_config=load_default_config_str(this);
+        if(!default_config_file.exists()
+                || !bundled_config.equals(Utils.load_string(default_config_file)))
+            Utils.save_string(default_config_file,bundled_config);
 
         if(!should_delay_load())
             Emulator.load_library();

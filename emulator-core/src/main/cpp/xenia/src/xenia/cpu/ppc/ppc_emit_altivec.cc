@@ -1598,8 +1598,11 @@ int InstrEmit_vsplth(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vspltw_(PPCHIRBuilder& f, uint32_t vd, uint32_t vb,
                       uint32_t uimm) {
   // (VD.xyzw) <- (VB.uimm)
-  Value* w = f.Extract(f.LoadVR(vb), uimm & 0x3, INT32_TYPE);
-  Value* v = f.Splat(w, VEC128_TYPE);
+  // A broadcast swizzle is one instruction on both backends; Extract+Splat
+  // costs a round trip through a general register.
+  const uint32_t lane = uimm & 0x3;
+  Value* v = f.Swizzle(f.LoadVR(vb), INT32_TYPE,
+                       MakeSwizzleMask(lane, lane, lane, lane));
   f.StoreVR(vd, v);
   return 0;
 }

@@ -87,7 +87,7 @@ DEFINE_bool(
     "break. Disable for A/B measurement of the break count.",
     "Vulkan");
 DEFINE_bool(
-    vulkan_in_pass_resolve, true,
+    vulkan_in_pass_resolve, false,
     "Prepare color attachments for in-pass EDRAM resolves with "
     "VK_KHR_dynamic_rendering_local_read: RENDERING_LOCAL_READ image layout "
     "and input-attachment usage on color render targets. Requires dynamic "
@@ -2299,13 +2299,18 @@ bool VulkanRenderTargetCache::TryInPassResolveCopy(
     dest_desc.base = resolve_info.copy_dest_base_unadjusted & 0x1FFFFFFF;
     dest_desc.pitch_div_32 =
         resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32;
-    dest_desc.x0 = resolve_info.copy_dest_x0;
-    dest_desc.y0 = resolve_info.copy_dest_y0;
+    // Where the texels actually land: a strip resolve advances its BASE while
+    // copy_dest_y0 stays put, so the bare y0 would record every strip over the
+    // same rows - they could never tile into full coverage, and a refused strip
+    // would hide behind a sibling's span.
+    dest_desc.x0 = uint32_t(int32_t(resolve_info.copy_dest_x0) + dest_delta_x);
+    dest_desc.y0 = uint32_t(int32_t(resolve_info.copy_dest_y0) + dest_delta_y);
     dest_desc.width = width;
     dest_desc.height = height;
     dest_desc.format = uint32_t(resolve_info.copy_dest_info.copy_dest_format);
     dest_desc.endian = uint32_t(resolve_info.copy_dest_info.copy_dest_endian);
     dest_desc.is_array = uint32_t(resolve_info.copy_dest_info.copy_dest_array);
+    dest_desc.wrote_texture = uint32_t(writes_texture);
     dest_desc.frame = command_processor_.GetCurrentFrame();
     texture_cache.NoteResolveDestination(dest_desc);
   }

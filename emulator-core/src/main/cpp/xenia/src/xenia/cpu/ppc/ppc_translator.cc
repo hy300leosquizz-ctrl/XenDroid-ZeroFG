@@ -20,7 +20,10 @@
 #include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/reset_scope.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/string.h"
+
+DECLARE_path(log_file);
 #include "xenia/cpu/compiler/compiler_passes.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
@@ -293,6 +296,10 @@ bool PPCTranslator::Translate(GuestFunction* function,
   if (cvars::disassemble_functions) {
     debug_info_flags |= DebugInfoFlags::kDebugInfoAllDisasm;
   }
+  const bool dump_this_function = IsDumpTarget(function->address());
+  if (dump_this_function) {
+    debug_info_flags |= DebugInfoFlags::kDebugInfoAllDisasm;
+  }
   if (cvars::trace_functions) {
     debug_info_flags |= DebugInfoFlags::kDebugInfoTraceFunctions;
   }
@@ -385,7 +392,45 @@ bool PPCTranslator::Translate(GuestFunction* function,
 
   DumpMachineCode(function);
 
+  if (dump_this_function) {
+    DumpTargetFunction(function);
+  }
+
   return true;
+}
+
+bool PPCTranslator::IsDumpTarget(uint32_t address) {
+  return !cvars::dump_functions_at.empty() &&
+         GuestAddressInList(cvars::dump_functions_at, address);
+}
+
+void PPCTranslator::DumpTargetFunction(GuestFunction* function) {
+  auto* debug_info = function->debug_info();
+  if (!debug_info) {
+    return;
+  }
+  // Next to the log, the one directory known writable on every platform.
+  std::filesystem::path dir = cvars::log_file.empty()
+                                  ? xe::filesystem::GetExecutableFolder()
+                                  : cvars::log_file.parent_path();
+  std::filesystem::path path =
+      dir / fmt::format("fndump_{:08X}.txt", function->address());
+  FILE* f = xe::filesystem::OpenFile(path, "wb");
+  if (!f) {
+    XELOGE("dump_functions_at: cannot write {}", xe::path_to_utf8(path));
+    return;
+  }
+  auto section = [f](const char* title, const char* body) {
+    fprintf(f, "\n===== %s =====\n%s\n", title, body ? body : "(none)");
+  };
+  fprintf(f, "guest function %08X-%08X, host code %p (%zu bytes)\n",
+          function->address(), function->end_address(),
+          function->machine_code(), function->machine_code_length());
+  section("PPC SOURCE", debug_info->source_disasm());
+  section("HIR (optimized)", debug_info->hir_disasm());
+  section("HOST MACHINE CODE", debug_info->machine_code_disasm());
+  fclose(f);
+  XELOGI("dump_functions_at: wrote {}", xe::path_to_utf8(path));
 }
 void PPCTranslator::Reset() { builder_->ResetPools(); }
 void PPCTranslator::DumpSource(GuestFunction* function,

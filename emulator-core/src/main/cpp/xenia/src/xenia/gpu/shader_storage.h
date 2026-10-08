@@ -230,8 +230,22 @@ class ShaderStorageWriter {
     auto pipeline_storage_file_path =
         shader_storage_shareable_root /
         fmt::format("{:08X}{}", title_id, pipeline_config.file_suffix);
+    {
+      std::error_code size_ec;
+      auto pipeline_size =
+          std::filesystem::file_size(pipeline_storage_file_path, size_ec);
+      XELOGI("Shader storage: pipeline file {} ({} bytes on disk)",
+             xe::path_to_utf8(pipeline_storage_file_path),
+             size_ec ? uint64_t(0) : uint64_t(pipeline_size));
+    }
     pipeline_storage_file_ =
         xe::filesystem::OpenFile(pipeline_storage_file_path, "a+b");
+    // Append-update streams start at end-of-file on bionic, so the header read
+    // below would hit EOF and condemn a perfectly good file. Writes still go to
+    // the end regardless of where the read cursor is.
+    if (pipeline_storage_file_) {
+      xe::filesystem::Seek(pipeline_storage_file_, 0, SEEK_SET);
+    }
     if (!pipeline_storage_file_) {
       XELOGE(
           "Failed to open the pipeline storage file for writing, persistent "
@@ -244,11 +258,27 @@ class ShaderStorageWriter {
     const uint32_t pipeline_storage_version_swapped =
         xe::byte_swap(pipeline_config.version);
     PipelineStorageFileHeader pipeline_header;
-    if (fread(&pipeline_header, sizeof(pipeline_header), 1,
-              pipeline_storage_file_) &&
+    std::memset(&pipeline_header, 0, sizeof(pipeline_header));
+    const bool pipeline_header_read =
+        fread(&pipeline_header, sizeof(pipeline_header), 1,
+              pipeline_storage_file_) != 0;
+    const bool pipeline_header_ok =
+        pipeline_header_read &&
         pipeline_header.magic == kPipelineStorageMagic &&
         pipeline_header.magic_api == pipeline_config.api_magic &&
-        pipeline_header.version_swapped == pipeline_storage_version_swapped) {
+        pipeline_header.version_swapped == pipeline_storage_version_swapped;
+    if (!pipeline_header_ok) {
+      XELOGI(
+          "Shader storage: pipeline header rejected (read={}, magic {:016X} "
+          "want {:016X}, api {:08X} want {:08X}, version {:08X} want {:08X}) - "
+          "storage is being reset",
+          pipeline_header_read, uint64_t(pipeline_header.magic),
+          uint64_t(kPipelineStorageMagic), uint32_t(pipeline_header.magic_api),
+          uint32_t(pipeline_config.api_magic),
+          uint32_t(xe::byte_swap(pipeline_header.version_swapped)),
+          uint32_t(pipeline_config.version));
+    }
+    if (pipeline_header_ok) {
       // Valid header, read pipeline descriptions.
       xe::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END);
       int64_t pipeline_storage_told_end =
@@ -305,6 +335,9 @@ class ShaderStorageWriter {
         GetShaderStorageFilePath(cache_root, title_id);
     shader_storage_file_ =
         xe::filesystem::OpenFile(shader_storage_file_path, "a+b");
+    if (shader_storage_file_) {
+      xe::filesystem::Seek(shader_storage_file_, 0, SEEK_SET);
+    }
     if (!shader_storage_file_) {
       XELOGE(
           "Failed to open the guest shader storage file for writing, "
@@ -316,9 +349,28 @@ class ShaderStorageWriter {
     }
 
     // Load shaders from storage.
+    {
+      std::error_code size_ec;
+      auto shader_size =
+          std::filesystem::file_size(shader_storage_file_path, size_ec);
+      XELOGI("Shader storage: shader file {} ({} bytes on disk)",
+             xe::path_to_utf8(shader_storage_file_path),
+             size_ec ? uint64_t(0) : uint64_t(shader_size));
+    }
     size_t shaders_loaded = 0;
     ShaderStorageFileHeader shader_header;
-    if (ValidateShaderStorageHeader(shader_storage_file_, shader_header)) {
+    std::memset(&shader_header, 0, sizeof(shader_header));
+    const bool shader_header_ok =
+        ValidateShaderStorageHeader(shader_storage_file_, shader_header);
+    if (!shader_header_ok) {
+      XELOGI(
+          "Shader storage: shader header rejected (magic {:08X} want {:08X}, "
+          "version {:08X} want {:08X}) - storage is being reset",
+          uint32_t(shader_header.magic), uint32_t(kShaderStorageMagic),
+          uint32_t(xe::byte_swap(shader_header.version_swapped)),
+          uint32_t(ShaderStoredHeader::kVersion));
+    }
+    if (shader_header_ok) {
       uint64_t shader_storage_valid_bytes = ReadShaderEntries(
           shader_storage_file_,
           [&](xenos::ShaderType type, const uint32_t* ucode_dwords,
@@ -330,6 +382,17 @@ class ShaderStorageWriter {
             }
             return false;
           });
+      {
+        std::error_code size_ec;
+        auto shader_size =
+            std::filesystem::file_size(shader_storage_file_path, size_ec);
+        if (!size_ec && uint64_t(shader_size) != shader_storage_valid_bytes) {
+          XELOGW(
+              "Shader storage: parsed {} of {} bytes, truncating the rest as "
+              "corrupt",
+              shader_storage_valid_bytes, uint64_t(shader_size));
+        }
+      }
       xe::filesystem::TruncateStdioFile(shader_storage_file_,
                                         shader_storage_valid_bytes);
     } else {

@@ -96,6 +96,9 @@ fun AppNavHost(container: AppContainer) {
                     navigateOnce("${Routes.CONTENT_MANAGER}/$titleId?name=${Uri.encode(name)}")
                 },
                 onOpenInstallContent = { navigateOnce(Routes.INSTALL_CONTENT) },
+                onInstallFromDisc = { path ->
+                    navigateOnce("${Routes.INSTALL_CONTENT}?src=" + Uri.encode(path))
+                },
             )
         }
         composable(Routes.SETTINGS) { entry ->
@@ -165,10 +168,17 @@ fun AppNavHost(container: AppContainer) {
                 viewModel(factory = container.gameContentManagerViewModelFactory(titleId))
             ContentManagerScreen(vm = vm, gameName = gameName, onBack = backStackEntry.backOnce(nav))
         }
-        composable(Routes.INSTALL_CONTENT) { entry ->
+        composable(
+            "${Routes.INSTALL_CONTENT}?src={src}",
+            arguments = listOf(navArgument("src") { nullable = true; defaultValue = null }),
+        ) { entry ->
             val vm: InstallContentViewModel =
                 viewModel(factory = container.installContentViewModelFactory())
-            InstallContentScreen(vm = vm, onBack = entry.backOnce(nav))
+            InstallContentScreen(
+                vm = vm,
+                onBack = entry.backOnce(nav),
+                sourcePath = entry.arguments?.getString("src")?.let { Uri.decode(it) },
+            )
         }
     }
 }

@@ -38,6 +38,13 @@ class VulkanTextureCache final : public TextureCache {
     uint32_t format;    // xenos::ColorFormat
     uint32_t endian;    // copy_dest_info.copy_dest_endian
     uint32_t is_array;  // copy_dest_info.copy_dest_array
+    // Whether the resolve also stored into the promoted texture. Every resolve
+    // is recorded, because promotion decides from this history and cannot store
+    // before it has happened, but only a resolve that actually wrote the image
+    // may count towards covering it - one refused for pitch, format or bounds
+    // updates shared memory alone, and serving over it shows the previous
+    // frame's texels.
+    uint32_t wrote_texture;
     // Memory is reused across scenes, so coverage must only trust resolves
     // from the frame being served.
     uint64_t frame;
@@ -73,10 +80,13 @@ class VulkanTextureCache final : public TextureCache {
   size_t resolve_dests_next_ = 0;
   // Whether a resolve wrote everything the texture would be uploaded from.
   bool IsResolveDestEligible(const Texture& texture) const;
-  // Whether full-width resolves have covered every row of the surface.
+  // Whether full-width resolves that STORED INTO THE IMAGE have covered every
+  // row of the surface. Format and endian are matched per span: a same-base
+  // resolve in another format was refused the store, so it covers nothing.
   bool ResolveDestsCoverSurface(uint32_t base, uint32_t size_bytes,
                                 uint32_t pitch_div_32, uint32_t width,
-                                uint32_t height, uint64_t frame) const;
+                                uint32_t height, xenos::TextureFormat format,
+                                uint32_t endian, uint64_t frame) const;
   VulkanTexture* FindResolveDestTexture(
       uint32_t base, uint32_t* base_delta_out = nullptr) const;
   bool ShouldPromoteToResolveDest(const TextureKey& key) const;
@@ -149,6 +159,12 @@ class VulkanTextureCache final : public TextureCache {
   // preceding host GPU work.
   void RequestTextures(uint32_t used_texture_mask) override;
 
+  // Layout the active binding's image currently resides in: GENERAL for
+  // promoted resolve destinations, SHADER_READ_ONLY_OPTIMAL otherwise (and for
+  // the null views). Descriptor writes must match it or sampling is undefined.
+  VkImageLayout GetActiveBindingImageLayout(uint32_t fetch_constant_index,
+                                            xenos::FetchOpDimension dimension,
+                                            bool is_signed) const;
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension,
                                               bool is_signed);
@@ -344,11 +360,17 @@ class VulkanTextureCache final : public TextureCache {
       kTransferDestination,
       kGuestShaderSampled,
       kSwapSampled,
+      // Promoted resolve destinations park here: GENERAL layout, sampleable
+      // AND storable, so an in-pass resolve never needs a mid-pass layout
+      // transition. STORAGE usage already forfeits UBWC on Adreno, so
+      // sampling from GENERAL costs these images nothing extra.
+      kResolveDestStorage,
     };
 
    private:
     VkImageView resolve_dest_storage_view_ = VK_NULL_HANDLE;
     uint64_t resolve_dest_written_frame_ = 0;
+    bool pending_storage_write_ = false;
 
    public:
     // Takes ownership of the image and its memory.
@@ -374,6 +396,15 @@ class VulkanTextureCache final : public TextureCache {
     void SetResolveDestWrittenFrame(uint64_t frame) {
       resolve_dest_written_frame_ = frame;
     }
+    Usage usage() const { return usage_; }
+    // An in-pass store happened and no barrier has covered it yet; the next
+    // bind must emit one even though the usage does not change.
+    bool ConsumePendingStorageWrite() {
+      bool pending = pending_storage_write_;
+      pending_storage_write_ = false;
+      return pending;
+    }
+    void SetPendingStorageWrite() { pending_storage_write_ = true; }
 
     // Doesn't transition (the caller must insert the barrier).
     Usage SetUsage(Usage new_usage) {
@@ -509,6 +540,10 @@ class VulkanTextureCache final : public TextureCache {
   void GetTextureUsageMasks(VulkanTexture::Usage usage,
                             VkPipelineStageFlags& stage_mask,
                             VkAccessFlags& access_mask, VkImageLayout& layout);
+  // Transitions a texture for guest-shader use: kResolveDestStorage (GENERAL)
+  // for promoted resolve destinations, kGuestShaderSampled otherwise, with a
+  // barrier when the usage changes or an in-pass store is pending.
+  void TransitionTextureForGuestShader(VulkanTexture& texture);
 
   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
 

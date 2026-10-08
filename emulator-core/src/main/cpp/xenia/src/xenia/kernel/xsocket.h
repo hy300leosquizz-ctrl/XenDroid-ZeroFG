@@ -33,6 +33,7 @@ enum class X_WSAError : uint32_t {
   X_WSAEINVAL = 0x2726,
   X_WSAENOTSOCK = 0x2736,
   X_WSAEMSGSIZE = 0x2738,
+  X_WSAENETDOWN = 0x2742,
 };
 
 struct XSOCKADDR {

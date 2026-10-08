@@ -10,8 +10,11 @@ import android.util.Log
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.Display
+import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.core.view.WindowCompat
@@ -21,6 +24,7 @@ import xendroid.compose.core.EmuProcessLink
 import xendroid.compose.core.EmulatorRuntime
 import xendroid.compose.core.FrontendLaunch
 import xendroid.compose.core.EmulatorSession
+import xendroid.compose.core.ResourceTelemetry
 import xendroid.compose.core.ScreenBrightnessSampler
 import xendroid.compose.core.SessionLogs
 import kotlin.math.abs
@@ -42,9 +46,6 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.DisposableEffect
@@ -63,6 +64,12 @@ import xendroid.compose.ui.disc.DiscSwapPanel
 import xendroid.compose.ui.keyboard.GuestKeyboardPanel
 import xendroid.compose.ui.keyboard.clampToUtf16Units
 import xendroid.compose.ui.messagebox.GuestMessageBoxPanel
+import xendroid.compose.ui.pause.PAUSE_OPTION_COUNT
+import xendroid.compose.settings.ConfigStore
+import xendroid.compose.ui.pause.PAUSE_OPTION_QUIT
+import xendroid.compose.ui.pause.PAUSE_OPTION_TOUCH_OVERLAY
+import xendroid.compose.ui.pause.PAUSE_OPTION_RESUME
+import xendroid.compose.ui.pause.PauseMenuPanel
 import xendroid.compose.ui.theme.xendroidTheme
 import xendroid.compose.gamepad.GamepadConfigDto
 import xendroid.compose.gamepad.GamepadController
@@ -71,7 +78,6 @@ import xendroid.compose.gamepad.Kc
 import xendroid.compose.gamepad.rememberAutoHide
 import xendroid.compose.data.GameButtons
 import xendroid.compose.data.KeymapStore
-import xendroid.compose.settings.ConfigStore
 
 /**
  * The :emu emulator host (separate process; see manifest). Reads game_uri from the Intent,
@@ -83,6 +89,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     companion object {
         private const val TAG = "EmuHost"
         private const val KEYBOARD_POLL_MS = 150L
+        private const val MAIN_SURFACE_VOTE_POLL_MS = 100L
         const val EXTRA_GAME_URI = "game_uri"   // keys must match GameLibraryViewModel
         const val EXTRA_DISC_LABELS = "disc_labels"
         const val EXTRA_DISC_PATHS = "disc_paths"
@@ -110,16 +117,31 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val session = EmulatorSession()
     private var surfaceView: SurfaceView? = null
     private var started = false          // surface-callback boot guard
+    // Panel maximum at the CURRENT resolution and its mode, recomputed by
+    // updateDisplayMaxMode, which every surface callback calls before they are needed.
+    private var displayMaxHz = 0.0f
+    private var displayMaxModeId = 0
+    // The Main Surface Authority vote (see syncMainSurfaceVote): whether the mode request
+    // is held, and which surface generation carries the frame-rate vote (-1: none).
+    private var mainSurfaceModeRequestHeld = false
+    private var preferredModeApplied = false
+    private var surfaceGeneration = 0
+    private var votedSurfaceGeneration = -1
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val pauseOnFocusLost = Runnable { if (session.booted) session.pause() }
 
     private val gamepad by lazy { GamepadController(applicationContext) }
     private val brightnessSampler = ScreenBrightnessSampler()
-    @Volatile private var overlayWantsBrightness = false
+    private val resourceTelemetry by lazy { ResourceTelemetry(applicationContext) }
+    @Volatile private var overlayWantsBrightness = false   // sampler should run while visible
     private var hapticsEnabled = false
     private val bootedState = mutableStateOf(false)
     private val showFpsOverlay = mutableStateOf(false) // Display|show_debug_overlay (native TOML config)
+    // Null until the first post-boot poll reads HID|show_touch_overlay. Mounting the overlay
+    // on an assumed value and unmounting a tick later fires its release-all teardown while
+    // the core is still booting.
+    private val showTouchOverlay = mutableStateOf<Boolean?>(null)
     private val menuOpenState = mutableStateOf(false)
     private val keyboardRequestState =
         mutableStateOf<Emulator.KeyboardRequest?>(null)
@@ -222,9 +244,158 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
     }.getOrDefault(false)
 
-    /** PRE-surface setup in order: setupContext -> setupGamePathReal -> launch args ->
-     *  uri info list. [absPath] is an absolute host path. */
+    /** The panel maximum at the resolution in use, and its mode, for the Main Surface
+     *  Authority vote. */
+    @Suppress("DEPRECATION")
+    private fun updateDisplayMaxMode() {
+        val activeDisplay: Display = windowManager.defaultDisplay
+        val supportedModes = activeDisplay.supportedModes.filter {
+            it.refreshRate.isFinite() && it.refreshRate > 0.0f
+        }
+        val currentMode = activeDisplay.mode
+        val sameResolutionModes = supportedModes.filter {
+            it.physicalWidth == currentMode.physicalWidth &&
+                it.physicalHeight == currentMode.physicalHeight
+        }
+        val candidates = if (sameResolutionModes.isNotEmpty()) {
+            sameResolutionModes
+        } else {
+            supportedModes
+        }
+        val best = candidates.maxByOrNull { it.refreshRate }
+        displayMaxHz = best?.refreshRate ?: 0.0f
+        displayMaxModeId = best?.modeId ?: 0
+    }
+
+    /*
+     * Host refresh request, part of the Main Surface Authority contract: the preferred
+     * display mode and the Surface frame-rate vote at the panel maximum. With ZeroFG's
+     * device B producing into this Surface they allow 120 Hz with no touch; the physical
+     * rate stays Android's choice. They are held only while B actually produces, which
+     * the native side publishes: before the handoff, after a handback, with ZeroFG off or
+     * when device B failed to qualify, the normal XenDroid path runs without them.
+     * Agnostic: the panel maximum at the resolution in use, independent of Game Turbo.
+     * Resolution is never changed. Main thread only.
+     */
+    private fun syncMainSurfaceVote() {
+        val active = session.zeroFgMainSurfaceActive()
+        if (active != mainSurfaceModeRequestHeld) {
+            mainSurfaceModeRequestHeld = active
+            applyMaxRefreshModeRequest(active)
+        }
+        val surface = surfaceView?.holder?.surface
+        if (active) {
+            // A surface re-create drops the vote, so each generation gets its own.
+            if (votedSurfaceGeneration != surfaceGeneration &&
+                surface != null && surface.isValid &&
+                applyMaxFrameRateVote(surface, true)
+            ) {
+                votedSurfaceGeneration = surfaceGeneration
+            }
+        } else if (votedSurfaceGeneration != -1) {
+            if (votedSurfaceGeneration == surfaceGeneration &&
+                surface != null && surface.isValid
+            ) {
+                applyMaxFrameRateVote(surface, false)
+            }
+            votedSurfaceGeneration = -1
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun applyMaxRefreshModeRequest(hold: Boolean) {
+        val currentHz = windowManager.defaultDisplay.refreshRate
+        if (!hold) {
+            if (!preferredModeApplied) return
+            preferredModeApplied = false
+            val applied = runCatching {
+                window.attributes = window.attributes.apply { preferredDisplayModeId = 0 }
+            }.isSuccess
+            Log.i(
+                "ZeroFGDisplay",
+                "ZeroFGRefreshRequest cleared applied=$applied active_hz=$currentHz " +
+                    "reason=msa_left_B",
+            )
+            return
+        }
+        if (displayMaxModeId == 0) {
+            Log.i(
+                "ZeroFGDisplay",
+                "ZeroFGRefreshRequest active_hz=$currentHz max_hz=$displayMaxHz " +
+                    "requested=none reason=no_max_mode",
+            )
+            return
+        }
+        // Held even when the panel is already at its maximum: the request is what keeps
+        // it there. 2026-10-07: with no touch (a controller), the HyperOS compositor
+        // latched our layer at 60 for minutes while the panel stayed at 120 and this
+        // request had been skipped as already_at_max.
+        val alreadyAtMax = displayMaxHz <= currentHz + 0.5f
+        val applied = runCatching {
+            window.attributes = window.attributes.apply {
+                preferredDisplayModeId = displayMaxModeId
+            }
+        }.isSuccess
+        preferredModeApplied = applied
+        Log.i(
+            "ZeroFGDisplay",
+            "ZeroFGRefreshRequest active_hz=$currentHz max_hz=$displayMaxHz " +
+                "requested_mode=$displayMaxModeId applied=$applied " +
+                "already_at_max=$alreadyAtMax reason=msa_producer_B",
+        )
+    }
+
+    /*
+     * Vote the panel maximum on XenDroid's own SurfaceView (vote), or withdraw it (0 Hz, no
+     * preference). COMPATIBILITY_DEFAULT says what the window wants, not that the content
+     * is fixed at this rate. Returns whether the call went through.
+     */
+    private fun applyMaxFrameRateVote(surface: Surface, vote: Boolean): Boolean {
+        val hz = if (vote) displayMaxHz else 0.0f
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || (vote && hz <= 0.0f)) {
+            Log.i(
+                "ZeroFGDisplay",
+                "ZeroFGSurfaceFrameRateVote requested=none max_hz=$displayMaxHz " +
+                    "reason=unsupported sdk=${Build.VERSION.SDK_INT}",
+            )
+            return false
+        }
+        val applied = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                surface.setFrameRate(
+                    hz,
+                    Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
+                    Surface.CHANGE_FRAME_RATE_ALWAYS,
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                surface.setFrameRate(hz, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+            }
+        }.isSuccess
+        // Android 15+: the view's frame-rate category. HIGH tells the refresh policy the
+        // content needs a high rate even with no touch (the HyperOS idle-touch heuristic
+        // otherwise latched our layer at 60); withdrawn with the vote.
+        var category = "unsupported"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            category = runCatching {
+                surfaceView?.setRequestedFrameRate(
+                    if (vote) View.REQUESTED_FRAME_RATE_CATEGORY_HIGH
+                    else View.REQUESTED_FRAME_RATE_CATEGORY_DEFAULT,
+                )
+                if (vote) "high" else "default"
+            }.getOrDefault("failed")
+        }
+        Log.i(
+            "ZeroFGDisplay",
+            "ZeroFGSurfaceFrameRateVote requested_hz=$hz applied=$applied " +
+                "category=$category valid=${surface.isValid} sdk=${Build.VERSION.SDK_INT} " +
+                "reason=${if (vote) "msa_producer_B" else "msa_left_B"}",
+        )
+        return applied
+    }
+
     private fun prepareNativeRealPath(absPath: String) {
+        updateDisplayMaxMode()
         session.setupContext(this)
         session.setupGamePathReal(absPath)
         session.setupLaunchArgs(arrayOf(
@@ -257,7 +428,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 val alpha by animateFloatAsState(
                     if (visible) cfg.globals.opacity else 0f, tween(500), label = "padAlpha")
 
-                val overlayActive = booted && cfg.globals.enabled
+                val padVisible = showTouchOverlay.value == true
+                val overlayActive = booted && cfg.globals.enabled && padVisible
                 // onStart/onStop co-own the sampler thread: no PixelCopy polling while backgrounded.
                 DisposableEffect(overlayActive) {
                     overlayWantsBrightness = overlayActive
@@ -274,7 +446,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                     // Stay MOUNTED whenever enabled (alpha drives only the DRAW): the pointerInput
                     // must keep receiving touches so the auto-hide wake tap fires, and so a held
                     // control is never unmounted mid-press (stuck).
-                    if (booted && cfg.globals.enabled) {
+                    if (booted && cfg.globals.enabled && padVisible) {
                         GamepadOverlay(
                             controls = controls,
                             opacity = alpha,
@@ -288,21 +460,40 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                         )
                     }
                     val showFps by showFpsOverlay
-                    // The onCreate read only saw the GLOBAL config; the per-game override lands
-                    // on the detached boot thread, so POLL the effective cvar after boot, else
-                    // "global off + per-game on" never shows the overlay.
+                    // The onCreate read of show_debug_overlay only saw the GLOBAL config;
+                    // xenia applies any per-game override on the detached boot thread, so
+                    // POLL the effective native cvar after boot. Without this, "global off
+                    // + per-game on" never shows the overlay. The same 1 Hz main-thread
+                    // poll forwards passive native atomics into ResourceTelemetry; sysfs
+                    // reads and CSV I/O remain on its background thread.
                     LaunchedEffect(booted) {
                         if (!booted) return@LaunchedEffect
                         while (isActive) {
                             showFpsOverlay.value = session.showDebugOverlayEnabled()
+                            resourceTelemetry.updateFrameRates(
+                                session.sourceFps(),
+                                session.outputFps(),
+                            )
+                            showTouchOverlay.value = session.showTouchOverlayEnabled()
                             delay(1000)
                         }
                     }
                     FpsOverlay(
                         session = session,
+                        resourceTelemetry = resourceTelemetry,
                         visible = booted && showFps,
                         modifier = Modifier.fillMaxSize(),
                     )
+
+                    // Main Surface Authority: hold the display vote only while ZeroFG's
+                    // device B produces into the Surface (see syncMainSurfaceVote).
+                    LaunchedEffect(booted) {
+                        if (!booted) return@LaunchedEffect
+                        while (isActive) {
+                            syncMainSurfaceVote()
+                            delay(MAIN_SURFACE_VOTE_POLL_MS)
+                        }
+                    }
 
                     // The emulator blocks a dispatch thread until answered.
                     val keyboardRequest by keyboardRequestState
@@ -402,17 +593,19 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                     messageBoxRequestState.value?.let { answerMessageBox(it.activeButton) }
                 }
                 BackHandler(enabled = !menuOpen && !keyboardOpen && !discOpen && !messageBoxOpen) {
+                    panelSelectedState.intValue = PAUSE_OPTION_RESUME
                     menuOpenState.value = true
                     if (session.booted) session.pause()
                 }
+                BackHandler(enabled = menuOpen) { closeMenuAndResume() }
                 if (menuOpen) xendroidTheme {
-                    AlertDialog(
-                        onDismissRequest = {
-                            menuOpenState.value = false
-                            if (session.booted) session.resumeIfPaused()
-                        },
-                        title = { Text("Paused") },
-                        confirmButton = { Button(onClick = { finish() }) { Text("Quit") } },
+                    PauseMenuPanel(
+                        selected = panelSelectedState.intValue,
+                        touchOverlayShown = showTouchOverlay.value == true,
+                        onToggleTouchOverlay = { toggleTouchOverlay() },
+                        onResume = { closeMenuAndResume() },
+                        onQuit = { finish() },
+                        modifier = Modifier.fillMaxSize(),
                     )
                 }
             }
@@ -437,6 +630,9 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     // SurfaceHolder.Callback: the load-bearing surface->boot ordering.
 
     override fun surfaceCreated(holder: SurfaceHolder) {
+        updateDisplayMaxMode()
+        ++surfaceGeneration
+        syncMainSurfaceVote()
         if (!started) {
             started = true
             session.attachSurface(holder.surface)
@@ -447,7 +643,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                     session.discSetKnown(labels.toList(), paths.toList())
                 }
                 session.bootOnce()
-                bootedState.value = true
+                bootedState.value = true                  // reveal the SP4 overlay post-boot
+                resourceTelemetry.start()                 // 1 Hz, off Source/render path
             } catch (t: RuntimeException) {
                 Log.e(TAG, "boot failed", t)
                 finish()                                  // fatal; single-shot core
@@ -463,6 +660,9 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         if (!started) return
         if (width == 0 || height == 0) return
+        updateDisplayMaxMode()
+        ++surfaceGeneration
+        syncMainSurfaceVote()
         session.changeSurface(width, height)
     }
 
@@ -486,9 +686,10 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         // pausing BEFORE the swapchain teardown keeps guest/GPU frames from racing the drain.
         mainHandler.removeCallbacks(pauseOnFocusLost)
         if (session.booted) session.pause()
-        brightnessSampler.stop()
-        // An orphaned core (main process died while we were on screen) hard-kills here, so it
-        // does so from a paused, quiescent state.
+        brightnessSampler.stop()                          // no PixelCopy polling while stopped
+        if (session.booted) resourceTelemetry.stop()      // periodic CSV already flushed
+        // Last: an orphaned core (main process died while we were on screen) hard-kills
+        // here, so it does so from a paused, quiescent state.
         EmuProcessLink.setEmuForeground(false)
     }
 
@@ -496,9 +697,12 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         super.onStart()
         EmuProcessLink.setEmuForeground(true)
         if (overlayWantsBrightness) surfaceView?.let { brightnessSampler.start(it) }
-        // resumeIfPaused (not bare resume) is idempotent: surfaceCreated already resumes on
-        // swapchain-recreate, so this is a no-op there; onStart additionally covers the pure
-        // screen-sleep case where the surface was NOT destroyed. Stay paused if the menu is open.
+        if (session.booted) resourceTelemetry.start()
+        // Mirror of onStop. resumeIfPaused() (not bare resume) stays idempotent: the
+        // swapchain-recreate path already calls resumeIfPaused() in surfaceCreated
+        // (line 246), so this second call is a no-op there; onStart additionally covers
+        // the pure screen-sleep case where the surface was NOT destroyed. Stay paused if the
+        // in-game menu is open (don't run the game behind the menu after returning).
         if (session.booted && !menuOpenState.value) session.resumeIfPaused()
     }
 
@@ -688,7 +892,39 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 { i -> if (i == 0) acceptKeyboard(keyboardTextState.value) else cancelKeyboard() },
                 { cancelKeyboard() })
         }
+        // Last: a guest prompt opened over the menu owns the input until it is answered.
+        if (menuOpenState.value) {
+            return PanelNav(PAUSE_OPTION_COUNT,
+                { i ->
+                    when (i) {
+                        PAUSE_OPTION_QUIT -> finish()
+                        PAUSE_OPTION_TOUCH_OVERLAY -> toggleTouchOverlay()
+                        else -> closeMenuAndResume()
+                    }
+                },
+                { closeMenuAndResume() })
+        }
         return null
+    }
+
+    /** Flips the live cvar for an immediate effect and persists it, leaving the menu open so
+     *  the result is visible behind it. */
+    private fun toggleTouchOverlay() {
+        val next = showTouchOverlay.value != true
+        showTouchOverlay.value = next
+        session.setShowTouchOverlay(next)
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching {
+                val handle = ConfigStore(applicationContext).openLive()
+                handle.putBool("HID", "show_touch_overlay", next)
+                handle.closeFile()
+            }.onFailure { Log.w(TAG, "persisting show_touch_overlay failed", it) }
+        }
+    }
+
+    private fun closeMenuAndResume() {
+        menuOpenState.value = false
+        if (session.booted) session.resumeIfPaused()
     }
 
     private fun isPanelKey(keyCode: Int): Boolean = when (keyCode) {

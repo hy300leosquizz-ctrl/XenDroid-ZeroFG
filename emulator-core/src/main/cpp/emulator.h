@@ -4,6 +4,7 @@
 #define APS3E_EMULATOR_H
 
 #include <android/native_window_jni.h>
+#include <cstdint>
 #include <mutex>
 #include <string>
 

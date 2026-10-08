@@ -17,7 +17,10 @@
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_stream.h"
 #if XE_PLATFORM_xendroid
+#include <dirent.h>
+#include <dlfcn.h>
 #include <sys/resource.h>
+#include <vector>
 #endif
 
 #include <atomic>
@@ -53,6 +56,15 @@ DEFINE_uint32(apu_max_queued_frames, 8,
               "delay. Lowering this value might cause performance issues. "
               "Value range: [4-64]",
               "APU");
+DEFINE_bool(apu_pump_topup, true,
+            "Let the audio buffer refill at up to twice real time while it is "
+            "running low, instead of only one frame per 5.33ms interval.",
+            "APU");
+DEFINE_bool(
+    apu_performance_hint, true,
+    "Register an ADPF performance hint session over the guest dispatch and "
+    "audio threads so the power HAL holds clocks for the audio deadline.",
+    "APU");
 UPDATE_from_uint32(apu_max_queued_frames, 2024, 8, 31, 20, 64);
 
 namespace xe {
@@ -109,6 +121,91 @@ X_STATUS AudioSystem::Setup(kernel::KernelState* kernel_state) {
 }
 
 #if XE_PLATFORM_xendroid
+// Reporting pump duration against the block deadline is the unprivileged way
+// to stop a power profile parking cores below what the mixer needs.
+// dlsym'd: ADPF is API 33+, minSdk is 29.
+class AudioPerformanceHint {
+ public:
+  void ReportPump(uint64_t actual_us) {
+    if (state_ == State::kDisabled) {
+      return;
+    }
+    if (state_ == State::kUninitialized) {
+      Initialize();
+      if (state_ == State::kDisabled) {
+        return;
+      }
+    }
+    report_(session_, static_cast<int64_t>(actual_us) * 1000);
+  }
+
+ private:
+  enum class State { kUninitialized, kActive, kDisabled };
+
+  void Initialize() {
+    state_ = State::kDisabled;
+    if (!cvars::apu_performance_hint) {
+      return;
+    }
+    void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!lib) {
+      return;
+    }
+    auto get_manager = reinterpret_cast<void* (*)()>(
+        dlsym(lib, "APerformanceHint_getManager"));
+    auto create_session = reinterpret_cast<void* (*)(
+        void*, const int32_t*, size_t, int64_t)>(
+        dlsym(lib, "APerformanceHint_createSession"));
+    report_ = reinterpret_cast<int (*)(void*, int64_t)>(
+        dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
+    if (!get_manager || !create_session || !report_) {
+      return;
+    }
+    void* manager = get_manager();
+    if (!manager) {
+      return;
+    }
+    std::vector<int32_t> tids;
+    if (DIR* dir = opendir("/proc/self/task")) {
+      while (dirent* entry = readdir(dir)) {
+        int32_t tid = atoi(entry->d_name);
+        if (tid <= 0) {
+          continue;
+        }
+        char comm_path[64];
+        snprintf(comm_path, sizeof(comm_path), "/proc/self/task/%d/comm", tid);
+        char comm[32] = {0};
+        if (FILE* f = fopen(comm_path, "r")) {
+          fgets(comm, sizeof(comm), f);
+          fclose(f);
+        }
+        if (!strncmp(comm, "Guest CPU", 9) || !strncmp(comm, "Audio Worker", 12) ||
+            !strncmp(comm, "XMA Decoder", 11)) {
+          tids.push_back(tid);
+        }
+      }
+      closedir(dir);
+    }
+    if (tids.empty()) {
+      return;
+    }
+    session_ = create_session(manager, tids.data(), tids.size(),
+                              AudioSystem::kAudioPumpInterval * int64_t(1000));
+    if (!session_) {
+      XELOGW("AudioPerformanceHint: createSession failed ({} threads)",
+             tids.size());
+      return;
+    }
+    XELOGI("AudioPerformanceHint: session over {} threads, target {}us",
+           tids.size(), AudioSystem::kAudioPumpInterval);
+    state_ = State::kActive;
+  }
+
+  State state_ = State::kUninitialized;
+  void* session_ = nullptr;
+  int (*report_)(void*, int64_t) = nullptr;
+};
+
 // Reports the first failure rather than dropping it: an app that is not
 // allowed to renice would otherwise look like it had succeeded.
 void ApplyAudioThreadPriority(const char* what) {
@@ -142,6 +239,9 @@ void AudioSystem::WorkerThreadMain() {
   // Re-applied in the loop below, because a later set_priority would undo it.
   ApplyAudioThreadPriority("Audio Worker");
   auto priority_last = std::chrono::steady_clock::now();
+#endif
+#if XE_PLATFORM_xendroid
+  AudioPerformanceHint audio_perf_hint;
 #endif
 
   // The host mixer releases a client's semaphore on its own coarse cadence,
@@ -256,8 +356,48 @@ void AudioSystem::WorkerThreadMain() {
     if (client_callback) {
       SCOPE_profile_cpu_i("apu", "xe::apu::AudioSystem->client_callback");
       uint64_t args[] = {client_callback_arg};
+      uint32_t submitted_before =
+          clients_[client_index].frames_submitted.load();
+#if XE_PLATFORM_xendroid
+      auto exec_begin = std::chrono::steady_clock::now();
+#endif
       processor_->Execute(worker_thread_->thread_state(), client_callback, args,
                           xe::countof(args));
+#if XE_PLATFORM_xendroid
+      audio_perf_hint.ReportPump(static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - exec_begin)
+              .count()));
+#endif
+      bool submitted =
+          clients_[client_index].frames_submitted.load() != submitted_before;
+
+      // Deadline pacing alone submits one block per interval, matching the
+      // drain rate, so the sink cannot refill after an underrun. Add at most
+      // one extra frame per interval while it is below half full: the guest
+      // then runs at most twice real time, briefly. Credits alone are not a
+      // usable signal for this - a guest that submits several frames from one
+      // callback, or from another thread, breaks the one-credit-one-frame
+      // assumption and the buffer gets driven far past real time, which some
+      // titles answer with corrupted audio.
+      AudioDriver* driver = nullptr;
+      {
+        auto global_lock = global_critical_region_.Acquire();
+        if (clients_[client_index].in_use) {
+          driver = clients_[client_index].driver;
+        }
+      }
+      // Refill to above the driver's rate-control depth, or playback slows at
+      // a depth this loop is happy to sit at.
+      const size_t topup_below = std::max<size_t>(queued_frames_ / 2, 4);
+      if (submitted && cvars::apu_pump_topup && driver && !paused_ &&
+          worker_running_ && driver->GetQueuedFrameCount() < topup_below &&
+          xe::threading::Wait(client_semaphores_[client_index].get(), false,
+                              std::chrono::milliseconds(0)) ==
+              xe::threading::WaitResult::kSuccess) {
+        processor_->Execute(worker_thread_->thread_state(), client_callback,
+                            args, xe::countof(args));
+      }
     }
   }
   XELOGW("AudioWorker: loop EXITED (worker_running_={})",
@@ -533,6 +673,17 @@ void AudioSystem::Pause() {
   pending_work_event_->Set();
   pause_fence_.Wait();
 
+  // Only once the worker is parked: a running sink drains a queue nothing is
+  // refilling, which reads as a starving producer.
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    for (size_t i = 0; i < kMaximumClientCount; ++i) {
+      if (clients_[i].in_use && clients_[i].driver) {
+        clients_[i].driver->Pause();
+      }
+    }
+  }
+
   xma_decoder_->Pause();
 }
 
@@ -541,6 +692,15 @@ void AudioSystem::Resume() {
     return;
   }
   paused_ = false;
+
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    for (size_t i = 0; i < kMaximumClientCount; ++i) {
+      if (clients_[i].in_use && clients_[i].driver) {
+        clients_[i].driver->Resume();
+      }
+    }
+  }
 
   resume_event_->Set();
 

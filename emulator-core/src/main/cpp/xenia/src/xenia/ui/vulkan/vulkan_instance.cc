@@ -42,9 +42,66 @@ vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator);
 #endif
 
 #if XE_PLATFORM_xendroid||XE_PLATFORM_ANDROID
+#include <sys/system_properties.h>
+
 #include "third_party/libadrenotools/include/adrenotools/priv.h"
 #include "third_party/libadrenotools/include/adrenotools/driver.h"
 extern std::string g_native_lib_dir;
+
+// Turnip quirks are keyed off the GPU generation and the vendor OS, both of which have
+// to be known before the driver library loads.
+namespace {
+
+// Adreno generation (6 for a6xx), 0 when the KGSL model node is unreadable.
+int AdrenoGeneration() {
+  char gpu_model[64] = {};
+  if (FILE* f = fopen("/sys/class/kgsl/kgsl-3d0/gpu_model", "r")) {
+    if (!fgets(gpu_model, sizeof(gpu_model), f)) {
+      gpu_model[0] = '\0';
+    }
+    fclose(f);
+  }
+  const char* model_digits = strpbrk(gpu_model, "0123456789");
+  return model_digits ? atoi(model_digits) / 100 : 0;
+}
+
+std::string SystemProperty(const char* name) {
+  char value[PROP_VALUE_MAX] = {};
+  int length = __system_property_get(name, value);
+  return length > 0 ? std::string(value, size_t(length)) : std::string();
+}
+
+// The version property each skin sets. Keyed on these rather than the manufacturer, so a
+// Samsung or Xiaomi device running stock or custom Android is not matched.
+constexpr const char* kVendorOsProperties[] = {
+    "ro.build.version.oneui",     // Samsung One UI
+    "ro.mi.os.version.name",      // Xiaomi HyperOS
+    "ro.mi.os.version.code",
+    "ro.miui.ui.version.name",    // Xiaomi MIUI
+    "ro.miui.ui.version.code",
+};
+
+// Logs every property it reads, including the empty ones, so a device that needs the hint
+// but is not matched here can be identified from its own log rather than a repro session.
+bool IsVendorOsNeedingUbwcFlagHint() {
+  std::string report;
+  bool matched = false;
+  for (const char* name : kVendorOsProperties) {
+    std::string value = SystemProperty(name);
+    if (!value.empty()) {
+      matched = true;
+    }
+    report += fmt::format(" {}='{}'", name, value);
+  }
+  XELOGI("Vendor OS probe: {} {} ({}){} -> UBWC flag hint {}",
+         SystemProperty("ro.product.manufacturer"),
+         SystemProperty("ro.product.model"),
+         SystemProperty("ro.build.version.release"), report,
+         matched ? "needed" : "not needed");
+  return matched;
+}
+
+}  // namespace
 
 DEFINE_string(vulkan_lib_path, "", "Custom Driver Library Path", "Vulkan");
 DEFINE_bool(
@@ -61,6 +118,13 @@ DEFINE_string(
         "rather than hidden. Empty leaves TU_DEBUG unset.",
         "Vulkan");
 UPDATE_from_string(turnip_debug, 2026, 7, 24, 12, "");
+
+DEFINE_string(
+    fd_dev_features, "",
+    "FD_DEV_FEATURES overrides for the Turnip driver. Empty auto-detects the "
+    "vendor OSes whose framebuffer stack needs enable_tp_ubwc_flag_hint=1 "
+    "(Samsung One UI, Xiaomi HyperOS/MIUI); set 'none' to inject nothing.",
+    "Vulkan");
 
 DEFINE_string(
     ir3_debug, "",
@@ -127,23 +191,27 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
     // which avoids a class of Adreno GPU hangs (device-loss).
     std::string tu_debug = cvars::turnip_debug;
     // Adreno 6xx: Turnip's shared-consts push delivery is broken there.
-    if (tu_debug.find("push_consts_per_stage") == std::string::npos) {
-      char gpu_model[64] = {};
-      if (FILE* f = fopen("/sys/class/kgsl/kgsl-3d0/gpu_model", "r")) {
-        if (!fgets(gpu_model, sizeof(gpu_model), f)) {
-          gpu_model[0] = '\0';
-        }
-        fclose(f);
-      }
-      const char* model_digits = strpbrk(gpu_model, "0123456789");
-      if (model_digits && atoi(model_digits) / 100 == 6) {
-        tu_debug += tu_debug.empty() ? "push_consts_per_stage"
-                                     : ",push_consts_per_stage";
-      }
+    if (tu_debug.find("push_consts_per_stage") == std::string::npos &&
+        AdrenoGeneration() == 6) {
+      tu_debug += tu_debug.empty() ? "push_consts_per_stage"
+                                   : ",push_consts_per_stage";
     }
     if (!tu_debug.empty()) {
       setenv("TU_DEBUG", tu_debug.c_str(), 1);
       XELOGI("Set TU_DEBUG={} for the Turnip Vulkan driver", tu_debug);
+    }
+    // One UI and HyperOS/MIUI: their framebuffer stack needs the UBWC flag hint for
+    // Turnip to sample rendered images correctly.
+    // Probed unconditionally: the log has to show what the device reported even when the
+    // cvar overrides the decision.
+    const bool needs_ubwc_flag_hint = IsVendorOsNeedingUbwcFlagHint();
+    std::string fd_features = cvars::fd_dev_features;
+    if (fd_features.empty() && needs_ubwc_flag_hint) {
+      fd_features = "enable_tp_ubwc_flag_hint=1";
+    }
+    if (!fd_features.empty() && fd_features != "none") {
+      setenv("FD_DEV_FEATURES", fd_features.c_str(), 1);
+      XELOGI("Set FD_DEV_FEATURES={} for the Turnip Vulkan driver", fd_features);
     }
     // Read when the compiler is created, so set it before the driver loads.
     if (!std::string(cvars::ir3_debug).empty()) {
@@ -177,7 +245,10 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
 
         XELOGI("Loading custom Vulkan driver: {}", custom_lib_path);
 
-        vulkan_instance->loader_= adrenotools_open_libvulkan(RTLD_NOW,ADRENOTOOLS_DRIVER_CUSTOM,nullptr
+        // CONTEXT_PRIORITY: ZeroFG's device asks KGSL for a higher priority
+        // than the game's (VulkanDevice::CreateIfSupported).
+        vulkan_instance->loader_= adrenotools_open_libvulkan(RTLD_NOW,
+                ADRENOTOOLS_DRIVER_CUSTOM | ADRENOTOOLS_DRIVER_CONTEXT_PRIORITY,nullptr
                 ,hook_dir.c_str()
                 ,custom_lib_dir.c_str()
                 ,custom_lib_name.c_str()

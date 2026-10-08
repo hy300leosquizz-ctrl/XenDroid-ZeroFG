@@ -496,7 +496,22 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // Rechecks submission number and reclaims per-submission resources. Pass 0 as
   // the submission to await to simply check status, or pass
   // GetCurrentSubmission() to wait for all queue operations to be completed.
-  void CheckSubmissionCompletionAndDeviceLoss(uint64_t await_submission);
+  enum class CompletionCheckReason : size_t {
+    kBookkeeping,
+    kFrameInFlight,
+    kQuery,
+    kResource,
+    kAllQueueOperations,
+    kCount,
+  };
+  void CheckSubmissionCompletionAndDeviceLoss(
+      uint64_t await_submission,
+      CompletionCheckReason reason = CompletionCheckReason::kBookkeeping);
+  void RecordCompletionDuration(CompletionCheckReason reason,
+                                uint64_t duration_ns, bool requested_ahead);
+  bool AwaitSubmissionForReason(uint64_t submission,
+                                CompletionCheckReason reason);
+  void MaybeLogCompletionHostTelemetry();
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -511,7 +526,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // pipeline creation requests.
   bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() {
-    CheckSubmissionCompletionAndDeviceLoss(GetCurrentSubmission());
+    CheckSubmissionCompletionAndDeviceLoss(
+        GetCurrentSubmission(), CompletionCheckReason::kAllQueueOperations);
     return !submission_open_ &&
            GetCompletedSubmission() + 1u >= GetCurrentSubmission();
   }
@@ -644,6 +660,30 @@ class VulkanCommandProcessor final : public CommandProcessor {
   VkDeviceSize zpd_fsi_counter_descriptor_range_ = 0;
 
   ui::vulkan::VulkanGPUCompletionTimeline completion_timeline_;
+  struct CompletionHostTelemetry {
+    static constexpr size_t kDurationSampleCapacity = 256;
+    struct ReasonStats {
+      uint64_t calls = 0;
+      uint64_t requested_ahead_calls = 0;
+      uint64_t total_ns = 0;
+      uint64_t max_ns = 0;
+      uint64_t over_1ms = 0;
+      uint64_t over_4ms = 0;
+      std::array<uint64_t, kDurationSampleCapacity> samples_ns = {};
+      size_t sample_count = 0;
+      size_t sample_cursor = 0;
+    };
+
+    uint64_t interval_start_ns = 0;
+    std::array<ReasonStats, size_t(CompletionCheckReason::kCount)>
+        by_reason = {};
+    uint64_t issue_swap_calls = 0;
+    uint64_t issue_swap_total_ns = 0;
+    uint64_t issue_swap_max_ns = 0;
+    uint64_t issue_swap_over_1ms = 0;
+    uint64_t issue_swap_over_4ms = 0;
+  } completion_host_telemetry_;
+
   // Per-frame GPU synchronization diagnostics (worker thread only), reported
   // alongside the log_gpu_frame_time_breakdown breakdown.
   struct VkFrameSyncStats {
@@ -786,6 +826,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
       submissions_in_flight_semaphores_;
 
   static constexpr uint32_t kMaxFramesInFlight = 3;
+  // Guest frames allowed in flight: kMaxFramesInFlight with ZeroFG, 2
+  // without it. Per-frame resources stay sized for
+  // kMaxFramesInFlight. Set once in SetupContext.
+  uint32_t frames_in_flight_limit_ = kMaxFramesInFlight;
   bool frame_open_ = false;
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
@@ -848,11 +892,14 @@ class VulkanCommandProcessor final : public CommandProcessor {
   static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 32768;
   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeStorageImage;
   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];
   ui::vulkan::LinkedTypeDescriptorSetAllocator
       transient_descriptor_allocator_uniform_buffer_;
   ui::vulkan::LinkedTypeDescriptorSetAllocator
       transient_descriptor_allocator_storage_buffer_;
+  ui::vulkan::LinkedTypeDescriptorSetAllocator
+      transient_descriptor_allocator_storage_image_;
   std::deque<UsedSingleTransientDescriptor> single_transient_descriptors_used_;
   std::array<std::vector<VkDescriptorSet>,
              size_t(SingleTransientDescriptorLayout::kCount)>
@@ -1140,6 +1187,9 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // bind de-dup compares slot pointers and the deferred command buffer
   // resolves the handle at replay.
   const std::atomic<VkPipeline>* current_guest_graphics_pipeline_;
+  // The handle the last recorded deferred bind captured; the first draw after
+  // the slot fills or swaps re-records with the new handle.
+  VkPipeline current_guest_graphics_pipeline_handle_ = VK_NULL_HANDLE;
   VkPipeline current_external_graphics_pipeline_;
   VkPipeline current_external_compute_pipeline_;
 

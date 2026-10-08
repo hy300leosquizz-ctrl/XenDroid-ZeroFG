@@ -101,7 +101,7 @@ present_safe_area_y = 90                          	# Percentage of the image hei
 
 
 [GPU]
-clear_memory_page_state = true                    	# Refresh state of memory pages to enable gpu written data. (Use for 'Team Ninja' Games to fix missing character models)
+clear_memory_page_state = false                   	# Refresh state of memory pages to enable gpu written data. (Use for 'Team Ninja' Games to fix missing character models)
 depth_float24_convert_in_pixel_shader = false     	# Whether to convert the depth values to 24-bit floating-point (20e4) from the host precision (32-bit floating point) directly in the pixel shaders of guest draws when using a host depth buffer.
                                                   	# This prevents visual artifacts (interleaved stripes of parts of surfaces rendered and parts not rendered, having either the same width in case of the "greater or equal" depth test function, or the former being much thinner than the latter with the "equal" function) if the full host precision depth data is lost.
                                                   	# This issue may happen if the game reloads the depth data previously evicted from the EDRAM to the RAM back to the EDRAM, but the EDRAM region that previously contained that depth buffer was overwritten by another depth buffer, or the game loads it to a different location in the EDRAM than it was previously placed at, thus Xenia is unable to restore the depth data with the original precision, and instead falls back to converting the lower-precision values, so in subsequent rendering passes for the same geometry, the actual depth values of the surfaces don't match those stored in the depth buffer anymore.
@@ -323,6 +323,7 @@ internal_display_resolution_y = 720               	# Custom height. See internal
 
 
 [Vulkan]
+zerofg_frame_generation = false                  	# ZeroFG V2 frame generation. Read when a game starts; changing it requires ending emulation and reopening the game.
 adrenotools_force_max_clocks = false              	# Custom Driver Force Max Clocks
 turnip_debug = "sysmem"                           	# TU_DEBUG flags for the Turnip (Mesa freedreno) Vulkan driver. 'sysmem' forces untiled rendering, avoiding a class of Adreno GPU hangs (device-loss). Empty leaves TU_DEBUG unset.
 vulkan_allow_present_mode_fifo_relaxed = true     	# When available, allow the relaxed first-in-first-out presentation mode (3rd priority), which causes waiting for host display vertical sync, but may present with tearing if frames don't meet the host display refresh rate.

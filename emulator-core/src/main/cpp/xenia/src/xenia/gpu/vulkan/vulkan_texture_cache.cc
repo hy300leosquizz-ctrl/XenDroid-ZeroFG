@@ -578,6 +578,36 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
   }
 }
 
+void VulkanTextureCache::TransitionTextureForGuestShader(
+    VulkanTexture& texture) {
+  texture.MarkAsUsed();
+  // A promoted resolve destination parks in GENERAL, sampleable and storable,
+  // so the in-pass store never needs a mid-pass layout transition.
+  VulkanTexture::Usage new_usage =
+      texture.resolve_dest_storage_view() != VK_NULL_HANDLE
+          ? VulkanTexture::Usage::kResolveDestStorage
+          : VulkanTexture::Usage::kGuestShaderSampled;
+  VkPipelineStageFlags dst_stage_mask;
+  VkAccessFlags dst_access_mask;
+  VkImageLayout new_layout;
+  GetTextureUsageMasks(new_usage, dst_stage_mask, dst_access_mask, new_layout);
+  VulkanTexture::Usage old_usage = texture.SetUsage(new_usage);
+  // An unchanged usage still needs a barrier when an in-pass store happened:
+  // nothing else orders the fragment's imageStore before the sampled read.
+  bool pending_store = texture.ConsumePendingStorageWrite();
+  if (old_usage != new_usage || pending_store) {
+    VkPipelineStageFlags src_stage_mask;
+    VkAccessFlags src_access_mask;
+    VkImageLayout old_layout;
+    GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask,
+                         old_layout);
+    command_processor_.PushImageMemoryBarrier(
+        texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+        src_stage_mask, dst_stage_mask, src_access_mask, dst_access_mask,
+        old_layout, new_layout);
+  }
+}
+
 void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -586,11 +616,6 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
   TextureCache::RequestTextures(used_texture_mask);
 
   // Transition the textures into the needed usage.
-  VkPipelineStageFlags dst_stage_mask;
-  VkAccessFlags dst_access_mask;
-  VkImageLayout new_layout;
-  GetTextureUsageMasks(VulkanTexture::Usage::kGuestShaderSampled,
-                       dst_stage_mask, dst_access_mask, new_layout);
   uint32_t textures_remaining = used_texture_mask;
   uint32_t index;
   while (xe::bit_scan_forward(textures_remaining, &index)) {
@@ -599,46 +624,47 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
     if (!binding) {
       continue;
     }
-    VulkanTexture* binding_texture =
-        static_cast<VulkanTexture*>(binding->texture);
-    if (binding_texture != nullptr) {
-      // Will be referenced by the command buffer, so mark as used.
-      binding_texture->MarkAsUsed();
-      VulkanTexture::Usage old_usage =
-          binding_texture->SetUsage(VulkanTexture::Usage::kGuestShaderSampled);
-      if (old_usage != VulkanTexture::Usage::kGuestShaderSampled) {
-        VkPipelineStageFlags src_stage_mask;
-        VkAccessFlags src_access_mask;
-        VkImageLayout old_layout;
-        GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask,
-                             old_layout);
-        command_processor_.PushImageMemoryBarrier(
-            binding_texture->image(),
-            ui::vulkan::util::InitializeSubresourceRange(), src_stage_mask,
-            dst_stage_mask, src_access_mask, dst_access_mask, old_layout,
-            new_layout);
-      }
+    if (binding->texture != nullptr) {
+      TransitionTextureForGuestShader(
+          *static_cast<VulkanTexture*>(binding->texture));
     }
-    VulkanTexture* binding_texture_signed =
-        static_cast<VulkanTexture*>(binding->texture_signed);
-    if (binding_texture_signed != nullptr) {
-      binding_texture_signed->MarkAsUsed();
-      VulkanTexture::Usage old_usage = binding_texture_signed->SetUsage(
-          VulkanTexture::Usage::kGuestShaderSampled);
-      if (old_usage != VulkanTexture::Usage::kGuestShaderSampled) {
-        VkPipelineStageFlags src_stage_mask;
-        VkAccessFlags src_access_mask;
-        VkImageLayout old_layout;
-        GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask,
-                             old_layout);
-        command_processor_.PushImageMemoryBarrier(
-            binding_texture_signed->image(),
-            ui::vulkan::util::InitializeSubresourceRange(), src_stage_mask,
-            dst_stage_mask, src_access_mask, dst_access_mask, old_layout,
-            new_layout);
-      }
+    if (binding->texture_signed != nullptr) {
+      TransitionTextureForGuestShader(
+          *static_cast<VulkanTexture*>(binding->texture_signed));
     }
   }
+}
+
+VkImageLayout VulkanTextureCache::GetActiveBindingImageLayout(
+    uint32_t fetch_constant_index, xenos::FetchOpDimension dimension,
+    bool is_signed) const {
+  // Resolved the same way GetActiveBindingOrNullImageView resolves the view,
+  // fallbacks included: the layout must describe the image that view actually
+  // points at. Every fallback (null views, the flattened 3D-as-2D image) lives
+  // in SHADER_READ_ONLY_OPTIMAL; only a view backed by a promoted resolve
+  // destination is in GENERAL.
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding || !AreDimensionsCompatible(dimension, binding->key.dimension)) {
+    return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+  if (dimension == xenos::FetchOpDimension::k2D &&
+      binding->key.dimension == xenos::DataDimension::k3D) {
+    return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+  const VulkanTextureBinding& vulkan_binding =
+      vulkan_texture_bindings_[fetch_constant_index];
+  if ((is_signed ? vulkan_binding.image_view_signed
+                 : vulkan_binding.image_view_unsigned) == VK_NULL_HANDLE) {
+    return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+  const Texture* texture =
+      (is_signed && IsSignedVersionSeparateForFormat(binding->key))
+          ? binding->texture_signed
+          : binding->texture;
+  return texture && static_cast<const VulkanTexture*>(texture)->usage() ==
+                        VulkanTexture::Usage::kResolveDestStorage
+             ? VK_IMAGE_LAYOUT_GENERAL
+             : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
 VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(
@@ -1407,6 +1433,13 @@ VkImageView VulkanTextureCache::GetResolveDestStorageView(
   if (!texture) {
     return VK_NULL_HANDLE;
   }
+  // A layout transition is illegal inside the render pass, so the store is
+  // only offered once the image is parked in GENERAL - its next guest bind
+  // does that, and until then the refusal leaves a coverage gap that routes
+  // the texture through the ordinary upload.
+  if (texture->usage() != VulkanTexture::Usage::kResolveDestStorage) {
+    return VK_NULL_HANDLE;
+  }
   if (info_out) {
     const TextureKey& key = texture->key();
     info_out->width = key.GetWidth();
@@ -1421,6 +1454,9 @@ void VulkanTextureCache::MarkResolveDestWritten(uint32_t base,
                                                 uint64_t frame) {
   if (VulkanTexture* texture = FindResolveDestTexture(base)) {
     texture->SetResolveDestWrittenFrame(frame);
+    // The fragment's imageStore is only ordered before later sampled reads by
+    // the barrier the next bind emits for this flag.
+    texture->SetPendingStorageWrite();
   }
 }
 
@@ -1527,7 +1563,7 @@ bool VulkanTextureCache::IsResolveDestEligible(const Texture& texture) const {
     }
     return ResolveDestsCoverSurface(
         texture_base, texture_size, d.pitch_div_32, key.GetWidth(),
-        key.GetHeight(),
+        key.GetHeight(), key.format, uint32_t(key.endianness),
         static_cast<const VulkanTexture&>(texture)
             .resolve_dest_written_frame());
   }
@@ -1536,12 +1572,10 @@ bool VulkanTextureCache::IsResolveDestEligible(const Texture& texture) const {
 
 // A byte union misses the unwritten columns of sub-rectangle resolves, so
 // require full-width resolves to cover every row.
-bool VulkanTextureCache::ResolveDestsCoverSurface(uint32_t base,
-                                                  uint32_t size_bytes,
-                                                  uint32_t pitch_div_32,
-                                                  uint32_t width,
-                                                  uint32_t height,
-                                                  uint64_t frame) const {
+bool VulkanTextureCache::ResolveDestsCoverSurface(
+    uint32_t base, uint32_t size_bytes, uint32_t pitch_div_32, uint32_t width,
+    uint32_t height, xenos::TextureFormat format, uint32_t endian,
+    uint64_t frame) const {
   if (!width || !height) {
     return false;
   }
@@ -1554,9 +1588,19 @@ bool VulkanTextureCache::ResolveDestsCoverSurface(uint32_t base,
     if (!d.width || !d.height || d.frame != frame) {
       continue;
     }
+    // Only a resolve that stored into the image covers it. One refused for
+    // pitch, format or bounds still wrote shared memory, so counting it would
+    // serve the previous frame's texels over the rows it never touched.
+    if (!d.wrote_texture) {
+      continue;
+    }
     // Strips advance the base, so accept any resolve inside the surface.
     if (d.base < base || d.base >= base + size_bytes ||
         d.pitch_div_32 != pitch_div_32) {
+      continue;
+    }
+    if (format != GetBaseFormat(xenos::TextureFormat(d.format)) ||
+        d.endian >= 4 || endian != d.endian) {
       continue;
     }
     // Partial width leaves columns unwritten - it can never contribute.
@@ -3642,6 +3686,14 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
       stage_mask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
       access_mask = VK_ACCESS_SHADER_READ_BIT;
       layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      break;
+    case VulkanTexture::Usage::kResolveDestStorage:
+      // Sampled by guest shaders and stored by in-pass resolve fragments;
+      // GENERAL so a mid-pass store never needs a layout transition.
+      stage_mask =
+          guest_shader_pipeline_stages_ | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+      access_mask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      layout = VK_IMAGE_LAYOUT_GENERAL;
       break;
   }
 }

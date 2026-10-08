@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -30,11 +31,11 @@ import kotlinx.coroutines.delay
 import java.util.Locale
 import kotlin.math.roundToInt
 import xendroid.compose.core.EmulatorSession
+import xendroid.compose.core.ResourceTelemetry
 
 /**
- * Small, draggable FPS / frame-time readout drawn over the Vulkan SurfaceView. Shows a RenderDoc-
- * style ~1s average fps alongside the INSTANT frame time. Polls the native lock-free frame-stats
- * atomics at [pollHz].
+ * Small, draggable Source / Output FPS readout drawn over the Vulkan SurfaceView. Polls the native
+ * lock-free frame-telemetry atomics at [pollHz].
  *
  * The user can drag it anywhere; its position is persisted in a :emu-process SharedPreferences (so
  * the same DataStore the main process uses is never touched cross-process). Visibility is owned by
@@ -43,6 +44,7 @@ import xendroid.compose.core.EmulatorSession
 @Composable
 fun FpsOverlay(
     session: EmulatorSession,
+    resourceTelemetry: ResourceTelemetry,
     visible: Boolean,
     modifier: Modifier = Modifier,
     pollHz: Int = 4,
@@ -53,23 +55,51 @@ fun FpsOverlay(
     val prefs = remember { context.getSharedPreferences("fps_overlay", Context.MODE_PRIVATE) }
     var offset by remember { mutableStateOf(Offset(prefs.getFloat("x", 0f), prefs.getFloat("y", 0f))) }
     var boxSize by remember { mutableStateOf(IntSize.Zero) }
-    var fps by remember { mutableStateOf(0.0) }
-    var frameMs by remember { mutableStateOf(0.0) }
+    var sourceFps by remember { mutableStateOf(0.0) }
+    var outputFps by remember { mutableStateOf(0.0) }
+    val resources by resourceTelemetry.snapshot.collectAsState()
 
     // ~4 Hz poll (250 ms) — enough for a human-readable readout while costing ~nothing.
     LaunchedEffect(pollHz) {
         val periodMs = 1000L / pollHz.coerceIn(1, 30)
         while (true) {
-            fps = session.averageFps()
-            frameMs = session.lastFrameTimeMs()
+            sourceFps = session.sourceFps()
+            outputFps = session.outputFps()
             delay(periodMs)
         }
     }
 
     Box(modifier.fillMaxSize().onSizeChanged { boxSize = it }) {
         Text(
-            text = String.format(Locale.US, "FPS %.0f  ·  %.1f ms", fps, frameMs),
-            color = Color.White.copy(alpha = 0.7f),       // soft, more transparent than the old yellow
+            text = buildString {
+                append(String.format(Locale.US, "Src %.0f  ·  Out %.0f", sourceFps, outputFps))
+                append('\n')
+                append("GPU ")
+                append(resources.gpuBusyPct?.let {
+                    String.format(Locale.US, "%.0f%%", it)
+                } ?: "--")
+                resources.gpuClockMhz?.let {
+                    append(String.format(Locale.US, " @ %.0fMHz", it))
+                }
+                append("  ")
+                append(resources.gpuTempMaxC?.let {
+                    String.format(Locale.US, "%.1fC", it)
+                } ?: "--")
+                append('\n')
+                append("CPU ")
+                append(resources.cpuMaxMhz?.let {
+                    String.format(Locale.US, "%.0fMHz", it)
+                } ?: "--")
+                append("  ")
+                append((resources.cpuTempMaxC ?: resources.cpuThermC)?.let {
+                    String.format(Locale.US, "%.1fC", it)
+                } ?: "--")
+                append("  Pwr ")
+                append(resources.batteryPowerW?.let {
+                    String.format(Locale.US, "%.1fW", it)
+                } ?: "--")
+            },
+            color = Color.White.copy(alpha = 0.7f),
             fontSize = 10.sp,
             fontFamily = FontFamily.Monospace,
             modifier = Modifier
@@ -80,7 +110,6 @@ fun FpsOverlay(
                     detectDragGestures(
                         onDrag = { change, drag ->
                             change.consume()
-                            // Clamp so the readout stays fully on-screen (size = this element's px).
                             val maxX = maxOf(0f, boxSize.width.toFloat() - size.width)
                             val maxY = maxOf(0f, boxSize.height.toFloat() - size.height)
                             offset = Offset(

@@ -1,4 +1,9 @@
-# Launching XenDroid from emulation frontends (ES-DE, Daijishō, ...)
+# Launching XenDroid-ZeroFG from emulation frontends (ES-DE, Daijishō, ...)
+
+XenDroid-ZeroFG installs as its own app, package `xendroid.zerofg`, next to
+XenDroid (`xendroid.compose`). The activity classes keep XenDroid's names, so
+the component is the new package with the old class. For XenDroid itself, use
+`xendroid.compose` in place of `xendroid.zerofg` below.
 
 XenDroid's emulator activity is exported and boots a game directly from a launch
 intent, the same way Dolphin/PPSSPP standalone integrations work. No XenDroid UI
@@ -7,7 +12,7 @@ to the frontend.
 
 ## Intent surface
 
-- **Component**: `xendroid.compose/xendroid.compose.EmulatorHostActivity`
+- **Component**: `xendroid.zerofg/xendroid.compose.EmulatorHostActivity`
 - **Action**: `xendroid.intent.action.xendroid` (or `android.intent.action.VIEW`)
 - **Game selection**, first match wins:
   1. string extra `game_uri` — absolute path, `file://`, or `content://`
@@ -24,7 +29,7 @@ format and work for ISO/ZAR/XEX alike.
 Command-line test:
 
 ```sh
-adb shell am start -n xendroid.compose/.EmulatorHostActivity \
+adb shell am start -n xendroid.zerofg/xendroid.compose.EmulatorHostActivity \
   -a xendroid.intent.action.xendroid \
   --es game_uri '/storage/emulated/0/ROMs/xbox360/Game.iso'
 ```
@@ -41,7 +46,7 @@ Files live in `ES-DE/custom_systems/` on the device.
 <ruleList>
   <emulator name="XENDROID">
     <rule type="androidpackage">
-      <entry>xendroid.compose/xendroid.compose.EmulatorHostActivity</entry>
+      <entry>xendroid.zerofg/xendroid.compose.EmulatorHostActivity</entry>
     </rule>
   </emulator>
 </ruleList>
@@ -72,7 +77,7 @@ SAF-style variant also works thanks to the content resolver:
 
 Create a custom player with:
 
-- Package: `xendroid.compose`
+- Package: `xendroid.zerofg`
 - Class/Component: `xendroid.compose.EmulatorHostActivity`
 - Action: `xendroid.intent.action.xendroid`
 - Extra (string): `game_uri` = `{file.path}` (Daijishō) / the raw path variable

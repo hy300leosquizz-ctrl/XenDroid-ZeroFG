@@ -828,36 +828,9 @@ bool VulkanSharedMemory::UploadRanges(
   upload_regions_.clear();
   VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
 
-  // for (auto upload_range : upload_page_ranges) {
-  for (unsigned int i = 0; i < num_upload_ranges; ++i) {
-    uint32_t upload_range_start = upload_page_ranges[i].first;
-    uint32_t upload_range_length = upload_page_ranges[i].second;
-    trace_writer_.WriteMemoryRead(upload_range_start << page_size_log2(),
-                                  upload_range_length << page_size_log2());
-
-    if (upload_range_length > 0 && !cvars::gpu_allow_invalid_upload_range) {
-      const uint32_t range_start_addr = upload_range_start << page_size_log2();
-      const uint32_t upload_range_last_page =
-          upload_range_start + upload_range_length - 1;
-      const uint32_t range_end_addr = upload_range_last_page
-                                      << page_size_log2();
-
-      const memory::PageAccess start_access =
-          memory().GetPhysicalHeap()->QueryRangeAccess(range_start_addr,
-                                                       range_start_addr);
-      const memory::PageAccess end_access =
-          memory().GetPhysicalHeap()->QueryRangeAccess(range_end_addr,
-                                                       range_end_addr);
-      if (start_access == xe::memory::PageAccess::kNoAccess ||
-          end_access == xe::memory::PageAccess::kNoAccess) {
-        XELOGE(
-            "Vulkan shared memory: Invalid upload range {:08X} length {:08X}",
-            upload_range_start, upload_range_length);
-        successful = false;
-        break;
-      }
-    }
-
+  // Uploads one span of pages that is known host-readable.
+  auto upload_span = [&](uint32_t upload_range_start,
+                         uint32_t upload_range_length) -> bool {
     while (upload_range_length) {
       VkBuffer upload_buffer;
       VkDeviceSize upload_buffer_offset, upload_buffer_size;
@@ -867,8 +840,7 @@ bool VulkanSharedMemory::UploadRanges(
           upload_buffer_size);
       if (upload_buffer_mapping == nullptr) {
         XELOGE("Shared memory: Failed to get a Vulkan upload buffer");
-        successful = false;
-        break;
+        return false;
       }
       MakeRangeValid(upload_range_start << page_size_log2(),
                      uint32_t(upload_buffer_size), false);
@@ -903,8 +875,83 @@ bool VulkanSharedMemory::UploadRanges(
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;
     }
+    return true;
+  };
+
+  // Marks decommitted pages valid without copying them: the buffer keeps its
+  // last-uploaded contents, which is what the console's GPU would have read
+  // out of physical RAM.
+  auto skip_span = [&](uint32_t page_first, uint32_t page_end) {
+    MakeRangeValid(page_first << page_size_log2(),
+                   (page_end - page_first) << page_size_log2(), false);
+    XELOGW(
+        "Vulkan shared memory: skipped upload of {} decommitted page(s) at "
+        "{:08X}, keeping last-uploaded contents",
+        page_end - page_first, page_first << page_size_log2());
+  };
+
+  // Pages the guest decommitted are PROT_NONE host-side, so they can be
+  // neither copied nor refused: a refusal is retried by every draw that still
+  // references the memory, and games legally free memory that live textures
+  // point at (the console GPU reads physical RAM, ignoring CPU page tables).
+  for (unsigned int i = 0; i < num_upload_ranges; ++i) {
+    const uint32_t upload_range_start = upload_page_ranges[i].first;
+    const uint32_t upload_range_length = upload_page_ranges[i].second;
+    trace_writer_.WriteMemoryRead(upload_range_start << page_size_log2(),
+                                  upload_range_length << page_size_log2());
+    if (!upload_range_length) {
+      continue;
+    }
+
+    auto* heap = memory().GetPhysicalHeap();
+    if (cvars::gpu_allow_invalid_upload_range ||
+        heap->QueryRangeAccess(
+            upload_range_start << page_size_log2(),
+            (upload_range_start + upload_range_length - 1)
+                << page_size_log2()) != xe::memory::PageAccess::kNoAccess) {
+      if (!upload_span(upload_range_start, upload_range_length)) {
+        successful = false;
+        break;
+      }
+      continue;
+    }
+
+    uint32_t span_start = UINT32_MAX;
+    uint32_t skipped_start = UINT32_MAX;
+    for (uint32_t page = upload_range_start;
+         page <= upload_range_start + upload_range_length; ++page) {
+      const uint32_t page_addr = page << page_size_log2();
+      const bool readable =
+          page < upload_range_start + upload_range_length &&
+          heap->QueryRangeAccess(page_addr, page_addr) !=
+              xe::memory::PageAccess::kNoAccess;
+      if (readable) {
+        if (skipped_start != UINT32_MAX) {
+          skip_span(skipped_start, page);
+          skipped_start = UINT32_MAX;
+        }
+        if (span_start == UINT32_MAX) {
+          span_start = page;
+        }
+      } else {
+        if (span_start != UINT32_MAX) {
+          if (!upload_span(span_start, page - span_start)) {
+            successful = false;
+            break;
+          }
+          span_start = UINT32_MAX;
+        }
+        if (page < upload_range_start + upload_range_length &&
+            skipped_start == UINT32_MAX) {
+          skipped_start = page;
+        }
+      }
+    }
     if (!successful) {
       break;
+    }
+    if (skipped_start != UINT32_MAX) {
+      skip_span(skipped_start, upload_range_start + upload_range_length);
     }
   }
   if (!upload_regions_.empty()) {

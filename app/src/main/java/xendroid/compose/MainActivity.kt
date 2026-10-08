@@ -19,9 +19,8 @@ import xendroid.compose.ui.library.EXTRA_GAME_URI
 import xendroid.compose.core.SessionLogs
 import xendroid.compose.ui.AppNavHost
 import xendroid.compose.ui.theme.xendroidTheme
-import xendroid.compose.updater.CooldownDialog
-import xendroid.compose.updater.getRemainingCooldown
-import xendroid.compose.updater.LatestVersionDialog
+import xendroid.compose.settings.ConfigStore
+import xendroid.compose.settings.seedTouchOverlayDefault
 import xendroid.compose.updater.UpdateDialog
 import xendroid.compose.updater.UpdateResult
 import xendroid.compose.updater.checkForUpdates
@@ -64,6 +63,8 @@ class MainActivity : ComponentActivity() {
 
                 // Pre-warm so settings doesn't pay the delay-load System.loadLibrary.
                 runCatching { EmulatorRuntime.ensureLoaded() }
+                // Needs the native config, so it follows ensureLoaded on this same thread.
+                runCatching { seedTouchOverlayDefault(appContext, ConfigStore(appContext)) }
             }
         }
 
@@ -78,9 +79,12 @@ class MainActivity : ComponentActivity() {
 
                 LaunchedEffect(Unit) {
                     if (frontendGame != null) return@LaunchedEffect
+                    // A debug build's -debug versionName never matches a release tag, so the
+                    // check always reports an update - to an APK whose .debug-suffixed package
+                    // could not replace this install anyway.
+                    if (BuildConfig.DEBUG) return@LaunchedEffect
                     if (!shouldCheckForUpdates(applicationContext)) {
                         Log.d("Updater", "Skipping update check (less than 5 minutes)")
-                          updateResult = UpdateResult.Cooldown(getRemainingCooldown(applicationContext))
                         return@LaunchedEffect
                     }
 
@@ -108,21 +112,9 @@ class MainActivity : ComponentActivity() {
                         )
                     }
 
-                    is UpdateResult.Latest -> {
-                        LatestVersionDialog(
-                            commitHash = result.commitHash,
-                            onDismiss = { updateResult = null }
-                        )
-                    }
-
-                    is UpdateResult.Cooldown -> {
-                        CooldownDialog(
-                            remainingMillis = result.remainingMillis,
-                            onDismiss = { updateResult = null }
-                        )
-                    }
-
-                    null -> {}
+                    // The check at start speaks only when there is an update; the
+                    // library's manual check still reports "latest".
+                    is UpdateResult.Latest, is UpdateResult.Cooldown, null -> {}
                 }
             }
         }

@@ -32,6 +32,10 @@ static const Quirk kQuirks[] = {
      "FMV slice desync with inlined restores"},
     {0x4D5307D1, "spirv_multiply_zero_test_on_bits", true,
      "ir3 cannot compile fmadz"},
+    {0x494707D4, "vulkan_in_pass_resolve", true, "in-pass resolves tuned here"},
+    {0x49470804, "vulkan_in_pass_resolve", true, "in-pass resolves tuned here"},
+    {0x494707D4, "network_enabled", false, "hangs on a blocking recvfrom"},
+    {0x49470804, "network_enabled", false, "hangs on a blocking recvfrom"},
     {0x4E4D083A, "spirv_multiply_zero_test_on_bits", true,
      "ir3 cannot compile fmadz"},
 };

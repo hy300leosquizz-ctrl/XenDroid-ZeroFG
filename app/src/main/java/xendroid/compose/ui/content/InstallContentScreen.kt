@@ -1,6 +1,7 @@
 package xendroid.compose.ui.content
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import xendroid.compose.ui.library.FolderBrowserScreen
@@ -15,11 +16,16 @@ import xendroid.compose.ui.library.FolderBrowserScreen
 fun InstallContentScreen(
     vm: InstallContentViewModel,
     onBack: () -> Unit,
+    sourcePath: String? = null,
 ) {
     val installState by vm.state.collectAsStateWithLifecycle()
 
+    // Launched for a known source (a disc the library recognised as carrying content):
+    // install it directly instead of asking the user to find the file again.
+    LaunchedEffect(sourcePath) { if (sourcePath != null) vm.install(sourcePath) }
+
     // Only show the picker while no install is in flight; the dialogs take over after.
-    if (installState is ContentInstallState.Idle) {
+    if (sourcePath == null && installState is ContentInstallState.Idle) {
         FolderBrowserScreen(
             onFileChosen = { path -> vm.install(path) },
             onCancel = onBack,

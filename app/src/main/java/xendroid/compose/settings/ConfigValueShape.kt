@@ -15,6 +15,15 @@ object ConfigValueShape {
 
     fun parseBool(raw: String?, def: Boolean) = when (raw) { "true" -> true; "false" -> false; else -> def }
 
+    private val stofPrefix =
+        Regex("""^\s*[+-]?(\d+\.?\d*|\.\d+|inf|nan|0x[0-9a-f])""", RegexOption.IGNORE_CASE)
+
+    /** Mirrors the native `is_float_number`: exactly one '.' and `std::stof` accepts a
+     *  numeric prefix (so "0.20t" counts too). Such a value is stored as a TOML double,
+     *  which a string cvar cannot read: it silently keeps its default. */
+    fun nativeStoresAsDouble(raw: String): Boolean =
+        raw.count { it == '.' } == 1 && stofPrefix.containsMatchIn(raw)
+
     /** Native ints come back via std::to_string; tolerate a value that round-tripped
      *  as a double (e.g. "8.0"). */
     fun parseInt(raw: String?, def: Int) = raw?.toIntOrNull() ?: raw?.toDoubleOrNull()?.toInt() ?: def

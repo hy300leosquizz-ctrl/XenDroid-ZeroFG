@@ -16,6 +16,7 @@
 #include <android/log.h>
 #include <jni.h>
 #include <array>
+#include <cmath>
 #include <filesystem>
 #include <memory>
 #include <sys/prctl.h>
@@ -67,6 +68,10 @@ DEFINE_bool(android_message_box, true,
             "UI");
 DEFINE_string(hid, "android", "Input system. Use: [android, nop]",
               "HID");
+DEFINE_bool(show_touch_overlay, true,
+            "Draw the on-screen controller. Seeded on first launch from whether "
+            "a physical controller was attached, and honoured as-is after that.",
+            "HID");
 
 DEFINE_path(
         storage_root, "",
@@ -802,10 +807,17 @@ namespace ae{
 
     void key_event(int key_code,bool pressed,int value){
         static const bool is_android=cvars::hid=="android";
-        if(is_android){
-            xe::hid::android::AndroidInputDriver* driver=reinterpret_cast<xe::hid::android::AndroidInputDriver*>(g_windowed_app_ref->emu->input_system()->driver(0));
-            driver->OnKey(key_code,pressed,value);
-        }
+        if(!is_android) return;
+        // Every hop can still be null while the detached boot thread builds the emulator,
+        // and input arrives in that window: a controller press on the boot splash, or the
+        // touch overlay releasing its keys as it leaves composition.
+        if(!g_windowed_app_ref || !g_windowed_app_ref->emu) return;
+        xe::hid::InputSystem* input_system=g_windowed_app_ref->emu->input_system();
+        // driver(0) indexes the vector, so the count must be checked, not the pointer.
+        if(!input_system || input_system->driver_count()==0) return;
+        auto* driver=reinterpret_cast<xe::hid::android::AndroidInputDriver*>(input_system->driver(0));
+        if(!driver) return;
+        driver->OnKey(key_code,pressed,value);
     }
     bool is_running(){
         if(!g_windowed_app_ref || !g_windowed_app_ref->emu) return false;

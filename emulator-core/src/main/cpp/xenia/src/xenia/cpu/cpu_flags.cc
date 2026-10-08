@@ -9,6 +9,8 @@
 
 #include "xenia/cpu/cpu_flags.h"
 
+#include <cstdio>
+
 DEFINE_string(cpu, "any", "Does nothing. CPU backend [any, x64].", "CPU");
 
 DEFINE_string(
@@ -17,8 +19,29 @@ DEFINE_string(
     "database.",
     "CPU");
 
+DEFINE_string(dump_functions_at, "",
+              "Comma-separated guest addresses (hex) whose PPC source, "
+              "optimized HIR and host machine code are written to "
+              "<log dir>/fndump_<address>.txt when first translated.",
+              "CPU");
 DEFINE_bool(disassemble_functions, false,
             "Disassemble functions during generation.", "CPU");
+
+DEFINE_string(log_guest_calls_at, "",
+              "Comma-separated guest addresses (hex) whose entry and return "
+              "are logged with the guest argument registers. arm64 only.",
+              "CPU");
+DEFINE_string(log_guest_call_fields, "",
+              "Comma-separated guest words to dump on every log_guest_calls_at "
+              "entry. Each term is <gpr>+<hex offset>, optionally followed by "
+              "><hex offset> to dereference it and re-offset, and by :<count> "
+              "for several words, e.g. \"r4+30,r4+4>F8,r4+4>B0:4\".",
+              "CPU");
+DEFINE_uint32(log_guest_calls_limit, 1000,
+              "Entry and return lines logged per address by "
+              "log_guest_calls_at; 0 is unlimited. A return whose value "
+              "differs from the last one is always logged.",
+              "CPU");
 
 DEFINE_bool(trace_functions, false, "Generate tracing for function statistics.",
             "CPU");
@@ -63,3 +86,38 @@ DEFINE_bool(break_condition_truncate, true, "truncate value to 32-bits", "CPU");
 
 DEFINE_bool(break_on_debugbreak, true, "int3 on JITed __debugbreak requests.",
             "CPU");
+
+namespace xe {
+namespace cpu {
+
+bool GuestAddressInList(const std::string& list, uint32_t address) {
+  for (size_t pos = 0; pos < list.size();) {
+    size_t end = list.find(',', pos);
+    if (end == std::string::npos) {
+      end = list.size();
+    }
+    std::string entry = list.substr(pos, end - pos);
+    pos = end + 1;
+    size_t first = entry.find_first_not_of(" \t");
+    if (first == std::string::npos) {
+      continue;
+    }
+    entry = entry.substr(first, entry.find_last_not_of(" \t") - first + 1);
+    if (entry.size() > 2 && entry[0] == '0' &&
+        (entry[1] == 'x' || entry[1] == 'X')) {
+      entry = entry.substr(2);
+    }
+    if (entry.size() > 4 && (entry.compare(0, 4, "sub_") == 0 ||
+                             entry.compare(0, 4, "SUB_") == 0)) {
+      entry = entry.substr(4);
+    }
+    uint32_t parsed = 0;
+    if (std::sscanf(entry.c_str(), "%X", &parsed) == 1 && parsed == address) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace cpu
+}  // namespace xe

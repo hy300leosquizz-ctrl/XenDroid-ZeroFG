@@ -39,10 +39,21 @@ public class Emulator extends xendroid.emulator.Emulator{
     public native double instant_fps();
     // RenderDoc-style average fps over a ~1s sliding window (0 before first present).
     public native double average_fps();
+    // Estimated intrinsic guest source cadence over a ~1s corrected-time window.
+    // The event is IssueSwap; synchronous intentional ZeroFG pacing waits are excluded.
+    public native double source_fps();
+    // Wall-clock rate of vkQueuePresentKHR calls accepted by the WSI.
+    public native double output_fps();
+    // Main Surface Authority: ZeroFG's device B produces into the main Surface.
+    // The host holds its display frame-rate vote only while this is true.
+    public native boolean zerofg_main_surface_active();
+    // Passive ZeroFG Source-first pacing/lifetime telemetry snapshot.
     // Effective Display|show_debug_overlay (the live cvar, with any per-game config
     // overlay applied by LoadGameConfig at boot). Poll post-boot: the per-game override
     // lands on the detached boot thread, so this only reflects it after the game loads.
     public native boolean show_debug_overlay_enabled();
+    public native boolean show_touch_overlay_enabled();
+    public native void set_show_touch_overlay(boolean value);
 
     // Mount the ISO at isoPath (a REAL host ISO path == game.launchUri in
     // real-path mode), walk its filesystem and pack it into a VERIFIED .zar at
@@ -63,6 +74,9 @@ public class Emulator extends xendroid.emulator.Emulator{
     // under their account XUID, everything else under machine XUID 0. Returns X_STATUS
     // (0 == success). Blocking VFS walk -- MUST be called off the main thread.
     public native int install_content(String srcPath, String contentRoot);
+    public native DiscContentItem[] list_disc_content(String discPath);
+    public native int install_disc_content(String discPath, String innerPath,
+                                           String contentRoot, String scratchDir);
 
     // Fraction 0..1 of the in-flight content install (0 when none). Poll for a bar.
     public native float installProgress();
@@ -188,6 +202,15 @@ public class Emulator extends xendroid.emulator.Emulator{
     public static class ContentItem {
         public String pkgDir;
         public String displayName;
+        public long size;
+    }
+
+    /** An installable package found inside a disc image, from list_disc_content. */
+    public static class DiscContentItem {
+        public String innerPath;
+        public String displayName;
+        public int titleId;
+        public int contentType;
         public long size;
     }
 

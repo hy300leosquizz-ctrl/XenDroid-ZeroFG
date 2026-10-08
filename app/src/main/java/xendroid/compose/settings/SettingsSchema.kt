@@ -13,6 +13,21 @@ object SettingsSchema {
 
     val categories: List<SettingsCategory> = listOf(
 
+        // Everything ZeroFG owns lives here, first in the list, regardless of which
+        // native section the CVar belongs to. The UI category is only a grouping:
+        // the stored key stays "$section|$name", so moving a setting here does not
+        // touch any persisted value. Previously these were scattered at the bottom
+        // of Display and were indistinguishable from the backend's own toggles.
+        SettingsCategory("ZeroFG", listOf(
+            // The native CVar lives in the Vulkan section, but this is a visual-output
+            // choice. It is read when a game starts; changing it is intentionally not a
+            // hot toggle.
+            l("Vulkan", "zerofg_mode", "Frame generation (ZeroFG)", "off",
+                "off" to "Off",
+                "zero" to "Zero (best image)",
+                "reallyzero" to "ReallyZero (lighter, for weaker GPUs)"),
+        )),
+
         SettingsCategory("Vulkan", listOf(
             b("Vulkan", "vulkan_sparse_shared_memory", "Sparse shared memory", true),
             b("Vulkan", "vulkan_log_debug_messages", "Log debug messages", false),
@@ -94,6 +109,11 @@ object SettingsSchema {
             b("Kernel", "allow_incompatible_title_update", "Allow incompatible title update", true),
             b("Kernel", "apply_title_update", "Apply title update", true),
             b("Kernel", "kernel_debug_monitor", "Kernel debug monitor", false),
+            b("Kernel", "network_enabled", "Networking", true),
+        )),
+
+        SettingsCategory("Controller", listOf(
+            b("HID", "show_touch_overlay", "Show on-screen controller", true),
         )),
 
         SettingsCategory("HID", listOf(
@@ -124,12 +144,11 @@ object SettingsSchema {
             l("Display", "postprocess_scaling_and_sharpening", "Scaling & sharpening", "",
                 "bilinear" to "bilinear", "cas" to "cas", "fsr" to "fsr",
                 "sgsr" to "SGSR1", "sgsr_edge" to "SGSR1 Edge Direction"),  // "" => bilinear (no selection)
-            b("Vulkan", "zerofg_frame_generation", "Frame Generation (ZeroFG)", false),
+            // ZeroFG and the frame-time diagnostic matrix used to sit here; they are
+            // their own category now.
             b("Display", "present_render_pass_clear", "Present render-pass clear", true),
             l("Display", "postprocess_antialiasing", "Antialiasing", "",
                 "none" to "none", "fxaa" to "fxaa", "fxaa_extreme" to "fxaa_extreme"), // "" => none
-            // host_present_from_non_ui_thread intentionally NOT exposed: forced true on Android
-            // (false black-screens the app), so there is no valid user choice to make.
             b("Display", "show_debug_overlay", "Show debug overlay", false),
         )),
 
@@ -137,8 +156,9 @@ object SettingsSchema {
             // A dropdown, not a slider: only a few values are meaningful, and "unlimited"
             // needs to be an explicit choice rather than the bottom of a range.
             l("GPU", "framerate_limit", "Frame rate limit", "60",
-                "60" to "60 FPS", "30" to "30 FPS", "45" to "45 FPS",
-                "90" to "90 FPS", "120" to "120 FPS", "0" to "Unlimited"),
+                "20" to "20 FPS", "30" to "30 FPS", "45" to "45 FPS",
+                "60" to "60 FPS", "90" to "90 FPS", "120" to "120 FPS",
+                "0" to "Unlimited"),
             b("GPU", "guest_display_refresh_cap", "Cap guest display refresh (VSync)", true),
             b("GPU", "store_shaders", "Store shaders", true),
             b("GPU", "resolve_resolution_scale_fill_half_pixel_offset", "Resolve scale: fill half-pixel offset", true),
@@ -238,6 +258,7 @@ object SettingsSchema {
         )),
 
         SettingsCategory("APU", listOf(
+            b("APU", "apu_pump_topup", "Audio pump top-up", true),
             i("Console", "xmp_default_volume", "XMP default volume", 70, 0, 100),
             b("APU", "ffmpeg_verbose", "FFmpeg verbose", false),
             b("APU", "mute", "Mute", false),

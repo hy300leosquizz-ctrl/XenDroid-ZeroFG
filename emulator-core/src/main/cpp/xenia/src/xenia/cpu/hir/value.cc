@@ -883,20 +883,10 @@ void Value::Permute(Value* src1, Value* src2, TypeName type) {
     shuffle_bytes(src1->constant.v128, perm, shuf1);
     shuffle_bytes(src2->constant.v128, perm, shuf2);
 
-    uint8_t mask = 0;
+    // Index < 8 selects the first source.
     for (int i = 0; i < 8; i++) {
-      if (perm_ctrl.i16[i] == 0) {
-        mask |= 1 << (7 - i);
-      }
-    }
-
-    // Blend: select from shuf1 where mask bit is set, shuf2 otherwise
-    for (int i = 0; i < 8; i++) {
-      if (mask & (1 << i)) {
-        constant.v128.u16[i] = shuf1.u16[i];
-      } else {
-        constant.v128.u16[i] = shuf2.u16[i];
-      }
+      constant.v128.u16[i] =
+          perm_ctrl.i16[i] == 0 ? shuf1.u16[i] : shuf2.u16[i];
     }
 
   } else {

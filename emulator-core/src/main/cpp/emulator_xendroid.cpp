@@ -1111,6 +1111,7 @@ static void j_setup_uri_info_list_file(JNIEnv* env,jobject self,jstring jpath ){
 
 // Toggled by the "Display|show_debug_overlay" cvar (defined in presenter.cc).
 DECLARE_bool(show_debug_overlay);
+DECLARE_bool(show_touch_overlay);
 
 // Returns the formatted overlay text, or null when the overlay is disabled so
 // the Java side can simply hide the view. Polled (~4 Hz) from the UI thread;
@@ -1159,6 +1160,20 @@ static jdouble j_average_fps(JNIEnv* env, jobject thiz) {
     return (jdouble)fps;
 }
 
+static jdouble j_source_fps(JNIEnv* env, jobject thiz) {
+    return (jdouble)xe::GetSourceFps();
+}
+
+static jdouble j_output_fps(JNIEnv* env, jobject thiz) {
+    return (jdouble)xe::GetOutputFps();
+}
+
+// Main Surface Authority: ZeroFG's device B produces into the main Surface.
+// The host holds its display frame-rate vote only while this is true.
+static jboolean j_zerofg_main_surface_active(JNIEnv* env, jobject thiz) {
+    return xe::IsZeroFGMainSurfaceActive() ? JNI_TRUE : JNI_FALSE;
+}
+
 // EFFECTIVE Display|show_debug_overlay, i.e. the live cvar AFTER any per-game config
 // overlay. xenia's LoadGameConfig applies a game-specific override into this cvar
 // during module load (on the detached boot thread), so the Compose overlay gate must
@@ -1167,6 +1182,18 @@ static jdouble j_average_fps(JNIEnv* env, jobject thiz) {
 // read-only bool; safe from any thread.
 static jboolean j_show_debug_overlay_enabled(JNIEnv* env, jobject thiz) {
     return cvars::show_debug_overlay ? JNI_TRUE : JNI_FALSE;
+}
+
+// EFFECTIVE HID|show_touch_overlay, polled like show_debug_overlay above so a per-game
+// override applied during module load is seen after boot.
+static jboolean j_show_touch_overlay_enabled(JNIEnv* env, jobject thiz) {
+    return cvars::show_touch_overlay ? JNI_TRUE : JNI_FALSE;
+}
+
+// Flips the live cvar so the pause-menu toggle takes effect on the next poll; the caller
+// persists it to the config separately.
+static void j_set_show_touch_overlay(JNIEnv* env, jobject thiz, jboolean value) {
+    cvars::show_touch_overlay = value == JNI_TRUE;
 }
 
 //public native int compressIsoToZar(String isoPath,String outZarPath);
@@ -1266,6 +1293,79 @@ static jint j_install_content(JNIEnv* env, jobject self, jstring srcPath,
     g_content_progress.total.store(0);
     xe::X_STATUS s = xe::vfs::InstallContentPackageStandalone(
             src, root, g_content_progress);
+    return (jint)s;
+#else
+    return (jint)X_STATUS_UNSUCCESSFUL;
+#endif
+}
+
+// public native Emulator.DiscContentItem[] list_disc_content(String discPath);
+// Enumerate the installable packages a disc image carries under \content\ (the
+// payload a mandatory-install title copies to the HDD). Off-main (disc walk).
+static jobjectArray j_list_disc_content(JNIEnv* env, jobject self,
+                                        jstring discPath) {
+#if XE_PLATFORM_xendroid
+    if (!discPath) return nullptr;
+    const char* dp = env->GetStringUTFChars(discPath, nullptr);
+    std::filesystem::path disc = std::filesystem::u8path(dp);
+    env->ReleaseStringUTFChars(discPath, dp);
+
+    std::vector<xe::vfs::DiscContentItem> items = xe::vfs::ListDiscContent(disc);
+
+    jclass cls = env->FindClass("xendroid/compose/Emulator$DiscContentItem");
+    jmethodID ctor = env->GetMethodID(cls, "<init>", "()V");
+    jfieldID fid_inner = env->GetFieldID(cls, "innerPath", "Ljava/lang/String;");
+    jfieldID fid_name = env->GetFieldID(cls, "displayName", "Ljava/lang/String;");
+    jfieldID fid_title = env->GetFieldID(cls, "titleId", "I");
+    jfieldID fid_type = env->GetFieldID(cls, "contentType", "I");
+    jfieldID fid_size = env->GetFieldID(cls, "size", "J");
+
+    jobjectArray arr = env->NewObjectArray((jsize)items.size(), cls, nullptr);
+    for (jsize i = 0; i < (jsize)items.size(); ++i) {
+        jobject obj = env->NewObject(cls, ctor);
+        env->SetObjectField(obj, fid_inner, env->NewStringUTF(items[i].inner_path.c_str()));
+        env->SetObjectField(obj, fid_name, env->NewStringUTF(items[i].display_name.c_str()));
+        env->SetIntField(obj, fid_title, (jint)items[i].title_id);
+        env->SetIntField(obj, fid_type, (jint)items[i].content_type);
+        env->SetLongField(obj, fid_size, (jlong)items[i].size);
+        env->SetObjectArrayElement(arr, i, obj);
+        env->DeleteLocalRef(obj);
+    }
+    return arr;
+#else
+    return nullptr;
+#endif
+}
+
+// public native int install_disc_content(String discPath, String innerPath,
+//                                        String contentRoot, String scratchDir);
+// Install one package named by list_disc_content. Shares installProgress with the
+// standalone installer. Returns X_STATUS (0 == success). Off the main thread.
+static jint j_install_disc_content(JNIEnv* env, jobject self, jstring discPath,
+                                   jstring innerPath, jstring contentRoot,
+                                   jstring scratchDir) {
+#if XE_PLATFORM_xendroid
+    using namespace xe;
+    if (!discPath || !innerPath || !contentRoot || !scratchDir) {
+        return (jint)X_STATUS_INVALID_PARAMETER;
+    }
+    const char* dp = env->GetStringUTFChars(discPath, nullptr);
+    const char* ip = env->GetStringUTFChars(innerPath, nullptr);
+    const char* cr = env->GetStringUTFChars(contentRoot, nullptr);
+    const char* sd = env->GetStringUTFChars(scratchDir, nullptr);
+    std::filesystem::path disc = std::filesystem::u8path(dp);
+    std::string inner = ip;
+    std::filesystem::path root = std::filesystem::u8path(cr);
+    std::filesystem::path scratch = std::filesystem::u8path(sd);
+    env->ReleaseStringUTFChars(discPath, dp);
+    env->ReleaseStringUTFChars(innerPath, ip);
+    env->ReleaseStringUTFChars(contentRoot, cr);
+    env->ReleaseStringUTFChars(scratchDir, sd);
+
+    g_content_progress.current.store(0);
+    g_content_progress.total.store(0);
+    xe::X_STATUS s = xe::vfs::InstallDiscContentPackage(
+            disc, inner, root, scratch, g_content_progress);
     return (jint)s;
 #else
     return (jint)X_STATUS_UNSUCCESSFUL;
@@ -1708,11 +1808,18 @@ int register_xendroid_Emulator(JNIEnv* env){
             ,{"debug_overlay_text", "()Ljava/lang/String;", (void *) j_debug_overlay_text}
             ,{"instant_fps", "()D", (void *) j_instant_fps}
             ,{"average_fps", "()D", (void *) j_average_fps}
+            ,{"source_fps", "()D", (void *) j_source_fps}
+            ,{"output_fps", "()D", (void *) j_output_fps}
+            ,{"zerofg_main_surface_active", "()Z", (void *) j_zerofg_main_surface_active}
             ,{"last_frame_time_ms", "()D", (void *) j_last_frame_time_ms}
             ,{"show_debug_overlay_enabled", "()Z", (void *) j_show_debug_overlay_enabled}
+            ,{"show_touch_overlay_enabled", "()Z", (void *) j_show_touch_overlay_enabled}
+            ,{"set_show_touch_overlay", "(Z)V", (void *) j_set_show_touch_overlay}
             ,{"compressIsoToZar", "(Ljava/lang/String;Ljava/lang/String;)I", (void *) j_compressIsoToZar}
             ,{"compressProgress", "()F", (void *) j_compressProgress}
             ,{"install_content", "(Ljava/lang/String;Ljava/lang/String;)I", (void *) j_install_content}
+            ,{"list_disc_content", "(Ljava/lang/String;)[Lxendroid/compose/Emulator$DiscContentItem;", (void *) j_list_disc_content}
+            ,{"install_disc_content", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I", (void *) j_install_disc_content}
             ,{"installProgress", "()F", (void *) j_installProgress}
             ,{"content_header", "(Ljava/lang/String;)Lxendroid/compose/Emulator$ContentInfo;", (void *) j_content_header}
             ,{"list_content", "(Ljava/lang/String;Ljava/lang/String;I)[Lxendroid/compose/Emulator$ContentItem;", (void *) j_list_content}

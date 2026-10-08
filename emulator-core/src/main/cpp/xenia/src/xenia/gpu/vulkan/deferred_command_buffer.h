@@ -122,11 +122,11 @@ class DeferredCommandBuffer {
   // graphics pipelines; the external / compute bind paths keep using the
   // by-value CmdVkBindPipeline.
   void CmdVkBindPipelineDeferred(VkPipelineBindPoint pipeline_bind_point,
-                                 const std::atomic<VkPipeline>* pipeline) {
+                                 VkPipeline pipeline_at_record) {
     auto& args = *reinterpret_cast<ArgsVkBindPipelineDeferred*>(WriteCommand(
         Command::kVkBindPipelineDeferred, sizeof(ArgsVkBindPipelineDeferred)));
     args.pipeline_bind_point = pipeline_bind_point;
-    args.pipeline = pipeline;
+    args.pipeline = pipeline_at_record;
   }
 
   void CmdVkBindVertexBuffers(uint32_t first_binding, uint32_t binding_count,
@@ -752,8 +752,11 @@ class DeferredCommandBuffer {
 
   struct ArgsVkBindPipelineDeferred {
     VkPipelineBindPoint pipeline_bind_point;
-    // Stable pointer to a pipeline slot; loaded (acquire) at Execute() time.
-    const std::atomic<VkPipeline>* pipeline;
+    // The slot's handle as observed at record time; the recorded draws'
+    // descriptor bindings only cover this pipeline's layout. Null when the
+    // async creation had not finished by then - a slot that fills in between
+    // record and Execute() must still drop its draws.
+    VkPipeline pipeline;
   };
 
   struct ArgsVkBindVertexBuffers {

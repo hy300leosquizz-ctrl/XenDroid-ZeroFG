@@ -12,6 +12,7 @@
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
@@ -40,6 +41,7 @@
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/ui/vulkan/vulkan_presenter.h"
+#include "xenia/ui/vulkan/zerofg_config.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
 DECLARE_bool(clear_memory_page_state);
@@ -155,6 +157,49 @@ namespace xe {
 namespace gpu {
 namespace vulkan {
 
+namespace {
+
+class ScopedHostDurationTelemetry {
+ public:
+  ScopedHostDurationTelemetry(bool enabled, uint64_t* calls,
+                              uint64_t* total_ns, uint64_t* max_ns,
+                              uint64_t* over_1ms, uint64_t* over_4ms)
+      : enabled_(enabled),
+        calls_(calls),
+        total_ns_(total_ns),
+        max_ns_(max_ns),
+        over_1ms_(over_1ms),
+        over_4ms_(over_4ms),
+        begin_(enabled ? std::chrono::steady_clock::now()
+                       : std::chrono::steady_clock::time_point{}) {}
+
+  ~ScopedHostDurationTelemetry() {
+    if (!enabled_) {
+      return;
+    }
+    const uint64_t duration_ns =
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - begin_)
+                     .count());
+    ++*calls_;
+    *total_ns_ += duration_ns;
+    *max_ns_ = std::max(*max_ns_, duration_ns);
+    *over_1ms_ += duration_ns >= 1000000ull;
+    *over_4ms_ += duration_ns >= 4000000ull;
+  }
+
+ private:
+  bool enabled_;
+  uint64_t* calls_;
+  uint64_t* total_ns_;
+  uint64_t* max_ns_;
+  uint64_t* over_1ms_;
+  uint64_t* over_4ms_;
+  std::chrono::steady_clock::time_point begin_;
+};
+
+}  // namespace
+
 // Generated with `xb buildshaders`.
 namespace shaders {
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/apply_gamma_pwl_cs.h"
@@ -175,6 +220,10 @@ constexpr VkDescriptorPoolSize
 constexpr VkDescriptorPoolSize
     VulkanCommandProcessor::kDescriptorPoolSizeStorageBuffer = {
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kLinkedTypeDescriptorPoolSetCount};
+
+constexpr VkDescriptorPoolSize
+    VulkanCommandProcessor::kDescriptorPoolSizeStorageImage = {
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kLinkedTypeDescriptorPoolSetCount};
 
 // 2x descriptors for texture images because of unsigned and signed bindings.
 constexpr VkDescriptorPoolSize
@@ -205,13 +254,21 @@ VulkanCommandProcessor::VulkanCommandProcessor(
               ->vulkan_device(),
           &kDescriptorPoolSizeStorageBuffer, 1,
           kLinkedTypeDescriptorPoolSetCount),
+      transient_descriptor_allocator_storage_image_(
+          static_cast<const ui::vulkan::VulkanProvider*>(
+              graphics_system->provider())
+              ->vulkan_device(),
+          &kDescriptorPoolSizeStorageImage, 1,
+          kLinkedTypeDescriptorPoolSetCount),
       transient_descriptor_allocator_textures_(
           static_cast<const ui::vulkan::VulkanProvider*>(
               graphics_system->provider())
               ->vulkan_device(),
           kDescriptorPoolSizeTextures,
           uint32_t(xe::countof(kDescriptorPoolSizeTextures)),
-          kLinkedTypeDescriptorPoolSetCount) {}
+          kLinkedTypeDescriptorPoolSetCount) {
+  completion_timeline_.SetNoPendingReclaimPoll(true);
+}
 
 VulkanCommandProcessor::~VulkanCommandProcessor() = default;
 
@@ -318,6 +375,13 @@ bool VulkanCommandProcessor::SetupContext() {
     XELOGE("Failed to initialize base command processor context");
     return false;
   }
+
+  // ZeroFG needs the third guest frame in flight: it is the room the game
+  // keeps ahead of the frames ZeroFG holds to generate between them. Without
+  // ZeroFG, two frames in flight keep the game closer to the screen.
+  frames_in_flight_limit_ = ui::vulkan::IsZeroFGRequested() ? 3u : 2u;
+  XELOGI("VulkanCommandProcessor: guest frames in flight limit = {}",
+         frames_in_flight_limit_);
 
   // Check if debug markers should be enabled (CVAR or RenderDoc detection).
   UpdateDebugMarkersEnabled();
@@ -2208,10 +2272,24 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                        uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  ScopedHostDurationTelemetry issue_swap_duration(
+      cvars::vulkan_completion_wait_telemetry,
+      &completion_host_telemetry_.issue_swap_calls,
+      &completion_host_telemetry_.issue_swap_total_ns,
+      &completion_host_telemetry_.issue_swap_max_ns,
+      &completion_host_telemetry_.issue_swap_over_1ms,
+      &completion_host_telemetry_.issue_swap_over_4ms);
+  xe::SourceBoundaryInflightScope source_issue_inflight_scope(
+      xe::SourceBoundaryInflightScope::Kind::kIssue);
 
   // Count one presented guest frame for the debug overlay's FPS / frame-time
   // stats (the game's real frame rate, independent of the host present path).
   xe::RecordGuestPresent();
+  // Keep the raw counter above intact; Source FPS uses its own corrected-time
+  // window anchored to the same one-event-per-IssueSwap boundary.
+  xe::RecordSourcePresent();
+
+  MaybeLogCompletionHostTelemetry();
 
   if (render_target_cache_) {
     render_target_cache_->LogResolveDetailsOnFrameEnd();
@@ -2286,11 +2364,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
 
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
+    xe::RecordSourcePublishError();
     return;
   }
 
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
+    xe::RecordSourcePublishError();
     return;
   }
 
@@ -2301,6 +2381,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format);
   if (swap_texture_view == VK_NULL_HANDLE) {
+    xe::RecordSourcePublishError();
     return;
   }
 
@@ -2843,8 +2924,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           PopDebugMarker();
         }
 
-        // Insert the release barrier - transition from GENERAL to the
-        // presenter's expected layout.
+        // Transition the completed normal GuestOutput to the presenter's
+        // internal sampled layout. ZeroFG ingress, when active, consumes the
+        // mailbox publication after this Source submission.
         PushImageMemoryBarrier(
             vulkan_context.image(),
             ui::vulkan::util::InitializeSubresourceRange(),
@@ -2858,8 +2940,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
         // queue, and also need to submit the release barrier.
-        EndSubmission(true);
-        return true;
+        return EndSubmission(true);
       });
 
   // End the frame even if did not present for any reason (the image refresher
@@ -3389,14 +3470,22 @@ VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
             SingleTransientDescriptorLayout::kStorageBufferCompute ||
         transient_descriptor_layout ==
             SingleTransientDescriptorLayout::kStorageBufferFragment;
+    bool is_storage_image =
+        transient_descriptor_layout ==
+        SingleTransientDescriptorLayout::kStorageImageFragment;
     ui::vulkan::LinkedTypeDescriptorSetAllocator&
         transient_descriptor_allocator =
-            is_storage_buffer ? transient_descriptor_allocator_storage_buffer_
-                              : transient_descriptor_allocator_uniform_buffer_;
+            is_storage_image
+                ? transient_descriptor_allocator_storage_image_
+                : (is_storage_buffer
+                       ? transient_descriptor_allocator_storage_buffer_
+                       : transient_descriptor_allocator_uniform_buffer_);
     VkDescriptorPoolSize descriptor_count;
-    descriptor_count.type = is_storage_buffer
-                                ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-                                : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    descriptor_count.type =
+        is_storage_image
+            ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+            : (is_storage_buffer ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                 : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
     descriptor_count.descriptorCount = 1;
     descriptor_set = transient_descriptor_allocator.Allocate(
         GetSingleTransientDescriptorLayout(transient_descriptor_layout),
@@ -3685,6 +3774,7 @@ void VulkanCommandProcessor::BindExternalGraphicsPipeline(
                                              pipeline);
   current_external_graphics_pipeline_ = pipeline;
   current_guest_graphics_pipeline_ = nullptr;
+  current_guest_graphics_pipeline_handle_ = VK_NULL_HANDLE;
   current_guest_graphics_pipeline_layout_ = VK_NULL_HANDLE;
 }
 
@@ -4147,7 +4237,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         texture_cache_->GetSubmissionToAwaitOnSamplerOverflow(
             samplers_overflowed_count);
     assert_true(sampler_overflow_await_submission <= GetCurrentSubmission());
-    CheckSubmissionCompletionAndDeviceLoss(sampler_overflow_await_submission);
+    CheckSubmissionCompletionAndDeviceLoss(
+        sampler_overflow_await_submission,
+        CompletionCheckReason::kResource);
   }
 
   // Set up the render targets - this may perform dispatches and draws.
@@ -4251,10 +4343,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // invalidation can be re-run after in-pass transfers replace the bound
   // pipeline (see below, after entering the render pass).
   auto bind_guest_graphics_pipeline = [&]() {
-  if (current_guest_graphics_pipeline_ != &pipeline->pipeline) {
+  // Bind the handle observed when this draw's bindings were decided
+  // (current_pipeline, loaded above), not the slot at replay time: the
+  // recorded descriptor sets cover only that pipeline's layout. A draw
+  // recorded while the slot was empty is dropped at replay even if the
+  // async creation finishes in between. De-dup on the handle, so the first
+  // draw after the slot fills (or swaps placeholder to real) re-records.
+  if (current_guest_graphics_pipeline_ != &pipeline->pipeline ||
+      current_guest_graphics_pipeline_handle_ != current_pipeline) {
     deferred_command_buffer_.CmdVkBindPipelineDeferred(
-        VK_PIPELINE_BIND_POINT_GRAPHICS, &pipeline->pipeline);
+        VK_PIPELINE_BIND_POINT_GRAPHICS, current_pipeline);
     current_guest_graphics_pipeline_ = &pipeline->pipeline;
+    current_guest_graphics_pipeline_handle_ = current_pipeline;
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
   }
   auto pipeline_layout = static_cast<const PipelineLayout*>(
@@ -5599,7 +5699,7 @@ CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenZPDQuery(
         XELOGI("ZPD: Stall awaiting submission={} completed_before={}",
                wait_for, completed_submission);
       }
-      completion_timeline_.AwaitSubmissionAndUpdateCompleted(wait_for);
+      AwaitSubmissionForReason(wait_for, CompletionCheckReason::kQuery);
       PumpQueryResolves();
     }
 
@@ -5830,7 +5930,8 @@ bool VulkanCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
   }
 
   if (wait_for_submission > GetCompletedSubmission()) {
-    completion_timeline_.AwaitSubmissionAndUpdateCompleted(wait_for_submission);
+    AwaitSubmissionForReason(wait_for_submission,
+                             CompletionCheckReason::kQuery);
   }
 
   PumpQueryResolves();
@@ -5889,8 +5990,95 @@ void VulkanCommandProcessor::LogRecentSubmissions(const char* context) {
   }
 }
 
+void VulkanCommandProcessor::RecordCompletionDuration(
+    const CompletionCheckReason reason, const uint64_t duration_ns,
+    const bool requested_ahead) {
+  if (!cvars::vulkan_completion_wait_telemetry) {
+    return;
+  }
+  auto& stats = completion_host_telemetry_.by_reason[size_t(reason)];
+  ++stats.calls;
+  stats.requested_ahead_calls += requested_ahead;
+  stats.total_ns += duration_ns;
+  stats.max_ns = std::max(stats.max_ns, duration_ns);
+  stats.over_1ms += duration_ns >= 1000000ull;
+  stats.over_4ms += duration_ns >= 4000000ull;
+  stats.samples_ns[stats.sample_cursor++ % stats.samples_ns.size()] =
+      duration_ns;
+  stats.sample_count = std::min(stats.sample_count + 1,
+                                stats.samples_ns.size());
+}
+
+void VulkanCommandProcessor::MaybeLogCompletionHostTelemetry() {
+  if (!cvars::vulkan_completion_wait_telemetry) {
+    return;
+  }
+  const uint64_t now_ns = FrameStatsNow();
+  if (!completion_host_telemetry_.interval_start_ns) {
+    completion_host_telemetry_.interval_start_ns = now_ns;
+    return;
+  }
+  if (now_ns - completion_host_telemetry_.interval_start_ns <
+      2500000000ull) {
+    return;
+  }
+
+  XELOGI(
+      "VkIssueSwapHost calls={} total/avg/max_us={}/{}/{} "
+      "over_1ms/4ms={}/{}",
+      completion_host_telemetry_.issue_swap_calls,
+      completion_host_telemetry_.issue_swap_total_ns / 1000,
+      completion_host_telemetry_.issue_swap_calls
+          ? completion_host_telemetry_.issue_swap_total_ns /
+                completion_host_telemetry_.issue_swap_calls / 1000
+          : 0,
+      completion_host_telemetry_.issue_swap_max_ns / 1000,
+      completion_host_telemetry_.issue_swap_over_1ms,
+      completion_host_telemetry_.issue_swap_over_4ms);
+  static constexpr const char* kCompletionReasonNames[] = {
+      "bookkeeping", "frame_in_flight", "query", "resource",
+      "all_queue_operations"};
+  for (size_t reason_index = 0;
+       reason_index < size_t(CompletionCheckReason::kCount); ++reason_index) {
+    auto reason = completion_host_telemetry_.by_reason[reason_index];
+    if (!reason.calls) {
+      continue;
+    }
+    uint64_t p90_ns = 0;
+    if (reason.sample_count) {
+      std::sort(reason.samples_ns.begin(),
+                reason.samples_ns.begin() + reason.sample_count);
+      p90_ns = reason.samples_ns[(reason.sample_count - 1) * 9 / 10];
+    }
+    XELOGI(
+        "VkCompletionWait reason={} calls/requested_ahead={}/{} "
+        "total/avg/p90/max_us="
+        "{}/{}/{}/{} over_1ms/4ms={}/{}",
+        kCompletionReasonNames[reason_index], reason.calls,
+        reason.requested_ahead_calls, reason.total_ns / 1000,
+        reason.total_ns / reason.calls / 1000, p90_ns / 1000,
+        reason.max_ns / 1000, reason.over_1ms, reason.over_4ms);
+  }
+  completion_host_telemetry_ = CompletionHostTelemetry{};
+  completion_host_telemetry_.interval_start_ns = now_ns;
+}
+
+bool VulkanCommandProcessor::AwaitSubmissionForReason(
+    const uint64_t submission, const CompletionCheckReason reason) {
+  if (!cvars::vulkan_completion_wait_telemetry) {
+    return completion_timeline_.AwaitSubmissionAndUpdateCompleted(submission);
+  }
+  const uint64_t completed_before = GetCompletedSubmission();
+  const uint64_t begin_ns = FrameStatsNow();
+  const bool result =
+      completion_timeline_.AwaitSubmissionAndUpdateCompleted(submission);
+  RecordCompletionDuration(reason, FrameStatsNow() - begin_ns,
+                           submission > completed_before);
+  return result;
+}
+
 void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
-    uint64_t await_submission) {
+    uint64_t await_submission, const CompletionCheckReason reason) {
   // Only report once, no need to retry a wait that won't succeed anyway.
   if (device_lost_) {
     return;
@@ -5910,6 +6098,8 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
     const uint64_t t0 = FrameStatsNow();
     completion_timeline_.AwaitSubmissionAndUpdateCompleted(await_submission);
     const uint64_t t1 = FrameStatsNow();
+    RecordCompletionDuration(reason, t1 - t0,
+                             await_submission > completed_before);
     if (await_submission) {
       vk_frame_sync_stats_.awaits++;
       vk_frame_sync_stats_.await_ns += t1 - t0;
@@ -6017,7 +6207,7 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
       vk_submit_times_.pop_front();
     }
   } else {
-    completion_timeline_.AwaitSubmissionAndUpdateCompleted(await_submission);
+    AwaitSubmissionForReason(await_submission, reason);
   }
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
@@ -6137,11 +6327,24 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame. Also check whether the device
   // is still available, and whether the await was successful.
-  uint64_t await_submission =
-      is_opening_frame
-          ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight]
-          : 0;
-  CheckSubmissionCompletionAndDeviceLoss(await_submission);
+  // A frame opened now reuses the per-frame slot of frame
+  // frame_current_ - kMaxFramesInFlight. With a lower frames-in-flight limit it
+  // waits for a later frame instead; frames complete in submission order, so
+  // that slot is free either way.
+  uint64_t await_submission = 0;
+  if (is_opening_frame) {
+    if (frames_in_flight_limit_ >= kMaxFramesInFlight) {
+      await_submission =
+          closed_frame_submissions_[frame_current_ % kMaxFramesInFlight];
+    } else if (frame_current_ > frames_in_flight_limit_) {
+      await_submission = closed_frame_submissions_
+          [(frame_current_ - frames_in_flight_limit_) % kMaxFramesInFlight];
+    }
+  }
+  CheckSubmissionCompletionAndDeviceLoss(
+      await_submission,
+      is_opening_frame ? CompletionCheckReason::kFrameInFlight
+                       : CompletionCheckReason::kBookkeeping);
   const uint64_t completed_submission = GetCompletedSubmission();
   if (device_lost_ || completed_submission < await_submission) {
     return false;
@@ -6212,6 +6415,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // without emitting an end (it would land in the new, unrelated buffer).
     pass_ts_open_pair_ = UINT32_MAX;
     current_guest_graphics_pipeline_ = nullptr;
+    current_guest_graphics_pipeline_handle_ = VK_NULL_HANDLE;
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
     current_external_compute_pipeline_ = VK_NULL_HANDLE;
     current_guest_graphics_pipeline_layout_ = nullptr;
@@ -6340,7 +6544,6 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-
   // Make sure everything needed for submitting exist.
   if (submission_open_) {
     if (!sparse_memory_binds_.empty() && semaphores_free_.empty()) {
@@ -6597,8 +6800,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &command_buffer.buffer;
+    uint64_t source_queue_lock_wait_ns = 0;
+    uint64_t source_submit_host_ns = 0;
     const VkResult submit_result = completion_timeline_.AcquireFenceAndSubmit(
-        vulkan_device->queue_family_graphics_compute(), 0, 1, &submit_info);
+        vulkan_device->queue_family_graphics_compute(), 0, 1, &submit_info,
+        &source_queue_lock_wait_ns, &source_submit_host_ns);
+    xe::RecordSourceQueueLockWait(source_queue_lock_wait_ns);
+    xe::RecordSourceSubmitHost(source_submit_host_ns);
     if (submit_result != VK_SUCCESS) {
       XELOGE(
           "VulkanCommandProcessor: Failed to submit a Vulkan command buffer - "
@@ -6741,6 +6949,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
   }
   single_transient_descriptors_used_.clear();
   transient_descriptor_allocator_storage_buffer_.Reset();
+  transient_descriptor_allocator_storage_image_.Reset();
   transient_descriptor_allocator_uniform_buffer_.Reset();
 }
 
@@ -7919,6 +8128,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
             texture_cache->GetActiveBindingOrNullImageView(
                 texture_binding.fetch_constant, texture_binding.dimension,
                 bool(texture_binding.is_signed)))));
+        // The written descriptor also carries the image layout, which changes
+        // when a texture is promoted to a resolve destination mid-frame.
+        scratch.push_back(uint64_t(texture_cache->GetActiveBindingImageLayout(
+            texture_binding.fetch_constant, texture_binding.dimension,
+            bool(texture_binding.is_signed))));
       }
     }
     if (sampler_count) {
@@ -8091,7 +8305,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
               texture_binding.fetch_constant, texture_binding.dimension,
               bool(texture_binding.is_signed));
       descriptor_image_info.imageLayout =
-          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          texture_cache_->GetActiveBindingImageLayout(
+              texture_binding.fetch_constant, texture_binding.dimension,
+              bool(texture_binding.is_signed));
     }
   }
   size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
@@ -8114,7 +8330,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
               texture_binding.fetch_constant, texture_binding.dimension,
               bool(texture_binding.is_signed));
       descriptor_image_info.imageLayout =
-          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          texture_cache_->GetActiveBindingImageLayout(
+              texture_binding.fetch_constant, texture_binding.dimension,
+              bool(texture_binding.is_signed));
     }
   }
   size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
