@@ -1,0 +1,87 @@
+name: Bug or crash
+description: Something breaks, crashes or looks wrong.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! The log is what lets us find the cause, so please attach it:
+        **Settings → Logging → Export session logs to Downloads**, then drag the `xendroid-logs-....zip` from your Downloads folder into the box below.
+  - type: input
+    id: phone
+    attributes:
+      label: Phone
+      description: Brand and model.
+      placeholder: "POCO F7 Ultra"
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: Chip / GPU
+      placeholder: "Snapdragon 8 Elite / Adreno 830"
+    validations:
+      required: true
+  - type: dropdown
+    id: driver
+    attributes:
+      label: Vulkan driver
+      description: "Settings → Vulkan → Custom Vulkan driver."
+      options:
+        - Turnip (custom driver)
+        - Phone's own driver (no custom driver)
+        - Another custom driver
+    validations:
+      required: true
+  - type: input
+    id: driver_name
+    attributes:
+      label: Driver name or version
+      placeholder: "Turnip_Gen8_V37"
+  - type: input
+    id: android
+    attributes:
+      label: Android version and system
+      placeholder: "Android 16, HyperOS 3"
+  - type: input
+    id: game
+    attributes:
+      label: Game
+      placeholder: "Gears of War 3"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: ZeroFG mode
+      options:
+        - Zero
+        - ReallyZero
+        - Off
+    validations:
+      required: true
+  - type: dropdown
+    id: without_zerofg
+    attributes:
+      label: Does it also happen with ZeroFG off?
+      options:
+        - "Yes"
+        - "No"
+        - Didn't try
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what you saw. A video helps too.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Attach the exported `xendroid-logs-....zip` here.
+    validations:
+      required: true

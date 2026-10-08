@@ -1,0 +1,76 @@
+name: How it runs on my phone
+description: Share how a game runs, smooth or not. Reports from new phones and GPUs help a lot.
+title: "[Performance] "
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before testing, turn on your phone's game or performance mode and add XenDroid-ZeroFG to it: many phones hold the CPU at half speed otherwise.
+        If you can, attach the log: **Settings → Logging → Export session logs to Downloads**.
+  - type: input
+    id: phone
+    attributes:
+      label: Phone
+      placeholder: "vivo X200 Pro"
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: Chip / GPU
+      placeholder: "Snapdragon 8 Elite / Adreno 830"
+    validations:
+      required: true
+  - type: dropdown
+    id: driver
+    attributes:
+      label: Vulkan driver
+      options:
+        - Turnip (custom driver)
+        - Phone's own driver (no custom driver)
+        - Another custom driver
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Game
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: ZeroFG mode
+      options:
+        - Zero
+        - ReallyZero
+        - Off
+    validations:
+      required: true
+  - type: input
+    id: fps
+    attributes:
+      label: Game fps and screen fps
+      description: "Settings → Display → Show debug overlay shows both."
+      placeholder: "game 30, screen 60"
+  - type: dropdown
+    id: game_mode
+    attributes:
+      label: Phone's game or performance mode
+      options:
+        - "On"
+        - "Off"
+        - Not sure
+  - type: textarea
+    id: feel
+    attributes:
+      label: How it feels
+      description: Smoothness, stutter, input lag, artifacts, heat.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (optional)
+      description: Attach the exported `xendroid-logs-....zip` here.

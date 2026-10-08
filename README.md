@@ -140,6 +140,26 @@ ZeroFG 1.0 is ready to use, and it has real limits:
   Other GPUs and drivers have not been tested by us yet.
 - **Displays.** It shines with 60 fps games on 120 Hz screens.
 
+## Tips and known issues
+
+- **Use a Turnip driver.** Settings → Vulkan → Custom Vulkan driver. ZeroFG
+  was validated with Turnip, and its GPU priority works best there.
+- **Known crash with Qualcomm's own driver.** On some phones (seen on an
+  Adreno 830), the phone's own Qualcomm driver crashes while compiling ZeroFG's
+  shaders, about two seconds into the game, when the first generated frame is
+  made. Use Turnip, or turn ZeroFG off on that phone. A fix is planned.
+- **Let the phone run at full speed.** Turn on the phone's game or performance
+  mode and add XenDroid-ZeroFG to it. Many phones otherwise hold the CPU at
+  half speed, and the emulator, which leans on the CPU, falls below 30 fps.
+- **Pick the mode.** Zero gives the best image. If the game's own frame rate
+  drops with Zero, try ReallyZero, which is lighter on the GPU.
+- **Below 30 fps.** ZeroFG still makes the motion smoother, but the controls
+  feel heavier: it waits for the next game frame, and slow game frames are
+  long. In fast shooters below 30 fps you may prefer ZeroFG off.
+- **Reporting a problem.** Settings → Logging → Export session logs to
+  Downloads, then open an issue with the `xendroid-logs-....zip` attached and
+  your phone, GPU, driver, game and ZeroFG mode. The issue forms ask for each.
+
 ## What changed in XenDroid itself
 
 Building ZeroFG meant pulling XenDroid's presentation apart. We found and fixed

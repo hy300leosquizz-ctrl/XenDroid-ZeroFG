@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Tips and known issues
+    url: https://github.com/hy300leosquizz-ctrl/XenDroid-ZeroFG#tips-and-known-issues
+    about: Driver, game mode, which mode to pick and the known crashes, before opening an issue.
+  - name: Collaboration and questions by e-mail
+    url: mailto:fgzerofg@gmail.com
+    about: Developers who want to port or improve ZeroFG, and anything that is not a bug report.
