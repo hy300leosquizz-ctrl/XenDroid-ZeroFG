@@ -194,6 +194,11 @@ settings, [GAME_COMPAT.md](GAME_COMPAT.md).
 The standalone engine, the presenter and integration notes for other hosts are
 in the [ZeroFG repository](https://github.com/hy300leosquizz-ctrl/ZeroFG).
 
+## Contact
+
+Questions, bug reports and collaboration: **fgzerofg@gmail.com**. A bug report
+helps most with the log the app exports and the phone, GPU and driver you used.
+
 ## Development and credits
 
 ZeroFG is developed through human–AI collaboration.
