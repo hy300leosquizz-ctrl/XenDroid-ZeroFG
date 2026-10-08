@@ -23,6 +23,7 @@ import java.util.zip.ZipOutputStream
 object SessionLogs {
     private const val TAG = "SessionLogs"
     private const val CAPTURE_NAME = "logcat-current.txt"
+    private const val RESOURCE_NAME = "resource-current.csv"
     private const val EXIT_TS_MARKER = ".exitinfo-ts"
     // Shelve only the newest portion of runaway logs.
     private const val MAX_SHELVED_BYTES = 64L * 1024 * 1024
@@ -46,6 +47,13 @@ object SessionLogs {
         val xeLog = File(Utils.get_log_file_path())
         val logsDir = File(xeLog.parentFile, "logs").apply { mkdirs() }
         startCapture(File(logsDir, CAPTURE_NAME))
+    }
+
+    /** Shared app-session resource series written by successive :emu processes. */
+    internal fun currentResourceFile(): File {
+        val xeLog = File(Utils.get_log_file_path())
+        val logsDir = File(xeLog.parentFile, "logs").apply { mkdirs() }
+        return File(logsDir, RESOURCE_NAME)
     }
 
     private fun readKeep(context: Context): Int = runCatching {
@@ -87,10 +95,15 @@ object SessionLogs {
         // Plain-file leftovers from an earlier failed zip get another chance.
         val leftovers = logsDir.listFiles { f ->
             f.name.startsWith("session_") &&
-                (f.name.endsWith("-xe.log") || f.name.endsWith("-logcat.txt"))
+                (f.name.endsWith("-xe.log") ||
+                    f.name.endsWith("-logcat.txt") ||
+                    f.name.endsWith("-resource.csv"))
         }?.toList() ?: emptyList()
-        val sources = (listOf(xeLog to "xe.log", capture to "logcat.txt") +
-            leftovers.map { it to it.name.substringAfter("session_").substringAfter('-') })
+        val sources = (listOf(
+            xeLog to "xe.log",
+            capture to "logcat.txt",
+            File(logsDir, RESOURCE_NAME) to "resource.csv",
+        ) + leftovers.map { it to it.name.substringAfter("session_").substringAfter('-') })
             .filter { it.first.isFile && it.first.length() > 0 }
         if (sources.isEmpty()) return
 
@@ -122,6 +135,8 @@ object SessionLogs {
                 ?.renameTo(File(logsDir, "session_$stamp-xe.log"))
             capture.takeIf { it.isFile }
                 ?.renameTo(File(logsDir, "session_$stamp-logcat.txt"))
+            File(logsDir, RESOURCE_NAME).takeIf { it.isFile }
+                ?.renameTo(File(logsDir, "session_$stamp-resource.csv"))
         }
     }
 
@@ -196,6 +211,7 @@ object SessionLogs {
         val current = listOf(
             xeLog to "current/xe.log",
             File(logsDir, CAPTURE_NAME) to "current/logcat.txt",
+            File(logsDir, RESOURCE_NAME) to "current/resource.csv",
         ).filter { it.first.isFile && it.first.length() > 0 }
         if (shelved.isEmpty() && current.isEmpty()) return null
 

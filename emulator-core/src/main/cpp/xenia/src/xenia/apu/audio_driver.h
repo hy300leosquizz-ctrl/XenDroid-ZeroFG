@@ -34,6 +34,9 @@ class AudioDriver {
   virtual void Pause() = 0;
   virtual void Resume() = 0;
   virtual void SetVolume(float volume) = 0;
+  // Frames submitted but not yet played. Drivers that cannot report it leave
+  // the default, which keeps callers on their paced path.
+  virtual size_t GetQueuedFrameCount() { return 0; }
 };
 
 }  // namespace apu

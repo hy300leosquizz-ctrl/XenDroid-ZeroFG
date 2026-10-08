@@ -9,6 +9,7 @@ struct VulkanDispatch {
 
   PFN_vkGetPhysicalDeviceMemoryProperties get_physical_device_memory_properties =
       nullptr;
+  PFN_vkGetPhysicalDeviceProperties get_physical_device_properties = nullptr;
   PFN_vkGetPhysicalDeviceFormatProperties get_physical_device_format_properties =
       nullptr;
 
@@ -18,6 +19,14 @@ struct VulkanDispatch {
   PFN_vkAllocateMemory allocate_memory = nullptr;
   PFN_vkFreeMemory free_memory = nullptr;
   PFN_vkBindImageMemory bind_image_memory = nullptr;
+
+  PFN_vkCreateBuffer create_buffer = nullptr;
+  PFN_vkDestroyBuffer destroy_buffer = nullptr;
+  PFN_vkGetBufferMemoryRequirements get_buffer_memory_requirements = nullptr;
+  PFN_vkBindBufferMemory bind_buffer_memory = nullptr;
+  PFN_vkMapMemory map_memory = nullptr;
+  PFN_vkUnmapMemory unmap_memory = nullptr;
+  PFN_vkInvalidateMappedMemoryRanges invalidate_mapped_memory_ranges = nullptr;
 
   PFN_vkCreateImageView create_image_view = nullptr;
   PFN_vkDestroyImageView destroy_image_view = nullptr;
@@ -38,12 +47,22 @@ struct VulkanDispatch {
   PFN_vkDestroyShaderModule destroy_shader_module = nullptr;
   PFN_vkCreateComputePipelines create_compute_pipelines = nullptr;
   PFN_vkDestroyPipeline destroy_pipeline = nullptr;
+  PFN_vkGetPipelineExecutablePropertiesKHR
+      get_pipeline_executable_properties = nullptr;
+  PFN_vkGetPipelineExecutableStatisticsKHR
+      get_pipeline_executable_statistics = nullptr;
 
   PFN_vkCmdBindPipeline cmd_bind_pipeline = nullptr;
   PFN_vkCmdBindDescriptorSets cmd_bind_descriptor_sets = nullptr;
   PFN_vkCmdPushConstants cmd_push_constants = nullptr;
   PFN_vkCmdDispatch cmd_dispatch = nullptr;
+  // Resolved only by the optional deferred-F2 context, never by default Load.
+  PFN_vkCmdDispatchIndirect cmd_dispatch_indirect = nullptr;
+  PFN_vkCmdCopyBuffer cmd_copy_buffer = nullptr;
+  PFN_vkCmdFillBuffer cmd_fill_buffer = nullptr;
+  PFN_vkCmdWriteTimestamp cmd_write_timestamp = nullptr;
   PFN_vkCmdPipelineBarrier cmd_pipeline_barrier = nullptr;
+  PFN_vkCmdPipelineBarrier2 cmd_pipeline_barrier_2 = nullptr;
   PFN_vkCmdBlitImage cmd_blit_image = nullptr;
 
   bool Load(VkInstance instance,
@@ -60,6 +79,9 @@ struct VulkanDispatch {
         reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
             get_instance_proc_addr(
                 instance, "vkGetPhysicalDeviceMemoryProperties"));
+    get_physical_device_properties =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+            get_instance_proc_addr(instance, "vkGetPhysicalDeviceProperties"));
     get_physical_device_format_properties =
         reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
             get_instance_proc_addr(
@@ -67,6 +89,7 @@ struct VulkanDispatch {
 
     if (!get_device_proc_addr ||
         !get_physical_device_memory_properties ||
+        !get_physical_device_properties ||
         !get_physical_device_format_properties) {
       return false;
     }
@@ -90,6 +113,19 @@ struct VulkanDispatch {
     ZEROFG_LOAD_DEVICE(bind_image_memory,
                        PFN_vkBindImageMemory,
                        "vkBindImageMemory");
+    ZEROFG_LOAD_DEVICE(create_buffer, PFN_vkCreateBuffer, "vkCreateBuffer");
+    ZEROFG_LOAD_DEVICE(destroy_buffer, PFN_vkDestroyBuffer,
+                       "vkDestroyBuffer");
+    ZEROFG_LOAD_DEVICE(get_buffer_memory_requirements,
+                       PFN_vkGetBufferMemoryRequirements,
+                       "vkGetBufferMemoryRequirements");
+    ZEROFG_LOAD_DEVICE(bind_buffer_memory, PFN_vkBindBufferMemory,
+                       "vkBindBufferMemory");
+    ZEROFG_LOAD_DEVICE(map_memory, PFN_vkMapMemory, "vkMapMemory");
+    ZEROFG_LOAD_DEVICE(unmap_memory, PFN_vkUnmapMemory, "vkUnmapMemory");
+    ZEROFG_LOAD_DEVICE(invalidate_mapped_memory_ranges,
+                       PFN_vkInvalidateMappedMemoryRanges,
+                       "vkInvalidateMappedMemoryRanges");
     ZEROFG_LOAD_DEVICE(create_image_view,
                        PFN_vkCreateImageView,
                        "vkCreateImageView");
@@ -150,6 +186,13 @@ struct VulkanDispatch {
     ZEROFG_LOAD_DEVICE(cmd_dispatch,
                        PFN_vkCmdDispatch,
                        "vkCmdDispatch");
+    ZEROFG_LOAD_DEVICE(cmd_copy_buffer, PFN_vkCmdCopyBuffer,
+                       "vkCmdCopyBuffer");
+    ZEROFG_LOAD_DEVICE(cmd_fill_buffer, PFN_vkCmdFillBuffer,
+                       "vkCmdFillBuffer");
+    ZEROFG_LOAD_DEVICE(cmd_write_timestamp,
+                       PFN_vkCmdWriteTimestamp,
+                       "vkCmdWriteTimestamp");
     ZEROFG_LOAD_DEVICE(cmd_pipeline_barrier,
                        PFN_vkCmdPipelineBarrier,
                        "vkCmdPipelineBarrier");
@@ -159,8 +202,27 @@ struct VulkanDispatch {
 
 #undef ZEROFG_LOAD_DEVICE
 
+    // Optional diagnostic APIs. They are used only when the host confirms the
+    // extension feature was enabled; missing pointers do not gate ZeroFG.
+    get_pipeline_executable_properties =
+        reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(
+            get_device_proc_addr(device,
+                                 "vkGetPipelineExecutablePropertiesKHR"));
+    get_pipeline_executable_statistics =
+        reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(
+            get_device_proc_addr(device,
+                                 "vkGetPipelineExecutableStatisticsKHR"));
+
+    // Vulkan 1.3-only. The historical SubZero path must remain usable on the
+    // legacy XenDroid Vulkan floor; RC1 validates this pointer and the
+    // enabled synchronization2 feature independently.
+    cmd_pipeline_barrier_2 = reinterpret_cast<PFN_vkCmdPipelineBarrier2>(
+        get_device_proc_addr(device, "vkCmdPipelineBarrier2"));
+
     return true;
   }
 };
 
 }  // namespace zerofg
+
+

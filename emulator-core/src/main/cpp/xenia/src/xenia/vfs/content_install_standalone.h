@@ -30,6 +30,32 @@ X_STATUS InstallContentPackageStandalone(
     const std::filesystem::path& src_path,
     const std::filesystem::path& content_root, ContentProgress& progress);
 
+struct DiscContentItem {
+  std::string inner_path;  // path inside the disc image, e.g. \content\...\pkg
+  std::string display_name;
+  uint32_t title_id;
+  uint32_t content_type;
+  uint64_t size;
+};
+
+// Enumerate the installable packages a disc image carries under \content\, the
+// payload a mandatory-install title (GTA V and friends) copies to the HDD before
+// it will run. Returns an empty vector for a disc with no such tree.
+// Blocking disc walk -- caller MUST run off the main thread.
+std::vector<DiscContentItem> ListDiscContent(
+    const std::filesystem::path& disc_path);
+
+// Install one package named by ListDiscContent's inner_path. The package is
+// staged out of the disc image into scratch_dir first, because the container
+// device reads a host file, then installed through the standalone path above
+// and the staged copy deleted. Returns X_STATUS (0 == success).
+// Blocking -- caller MUST run off the main thread.
+X_STATUS InstallDiscContentPackage(const std::filesystem::path& disc_path,
+                                   const std::string& inner_path,
+                                   const std::filesystem::path& content_root,
+                                   const std::filesystem::path& scratch_dir,
+                                   ContentProgress& progress);
+
 struct InstalledContentItem {
   std::string pkg_dir;
   std::string display_name;

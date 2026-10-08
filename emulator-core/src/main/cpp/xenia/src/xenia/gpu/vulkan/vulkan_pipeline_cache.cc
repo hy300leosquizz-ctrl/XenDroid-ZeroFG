@@ -59,6 +59,13 @@ namespace shaders {
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/ucode_interpreter_vs.h"
 }  // namespace shaders
 
+DEFINE_bool(
+    pipeline_storage_precreate, true,
+    "Create the pipelines described by previous runs when a title starts, so "
+    "they do not compile mid-gameplay. Off still loads and reuses the stored "
+    "shaders.",
+    "GPU");
+
 DEFINE_int32(
     vulkan_pipeline_creation_threads, -1,
     "Number of threads used for graphics pipeline creation. -1 to calculate "
@@ -2988,6 +2995,11 @@ void VulkanPipelineCache::InitializeShaderStorage(
   }
 
   // Create pipelines from stored descriptions.
+  if (!cvars::pipeline_storage_precreate) {
+    XELOGI("Pipeline cache: skipping pre-creation of {} stored pipelines",
+           pipeline_stored_descriptions.size());
+    pipeline_stored_descriptions.clear();
+  }
   if (!pipeline_stored_descriptions.empty()) {
     uint64_t pipeline_creation_start = xe::Clock::QueryHostTickCount();
 

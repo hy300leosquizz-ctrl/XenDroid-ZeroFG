@@ -142,15 +142,14 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       case Command::kVkBindPipelineDeferred: {
         auto& args =
             *reinterpret_cast<const ArgsVkBindPipelineDeferred*>(stream);
-        VkPipeline pipeline = args.pipeline->load(std::memory_order_acquire);
-        if (pipeline != VK_NULL_HANDLE) {
+        if (args.pipeline != VK_NULL_HANDLE) {
           dfn.vkCmdBindPipeline(command_buffer, args.pipeline_bind_point,
-                                pipeline);
+                                args.pipeline);
           guest_graphics_pipeline_unready = false;
         } else {
-          // Asynchronous creation hasn't completed (vulkan_async_skip_draws
-          // replay without the submission-boundary wait) or failed entirely -
-          // drop the draws recorded for this pipeline.
+          // The asynchronous creation had not completed when the draws were
+          // recorded, so their descriptor bindings cover only the interim
+          // pipeline layout - drop them, even if the pipeline exists by now.
           guest_graphics_pipeline_unready = true;
         }
       } break;

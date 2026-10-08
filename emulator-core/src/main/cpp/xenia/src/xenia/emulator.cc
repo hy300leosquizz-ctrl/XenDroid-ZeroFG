@@ -2599,17 +2599,14 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     }
   }
 
-  // Initialize shader storage asynchronously - pipeline compilation happens in
-  // background while the game goes through its normal startup (loading screens,
-  // intro videos, etc.). With async_shader_compilation enabled, draws are
-  // skipped until pipelines are ready, so this is safe. By the time actual
-  // gameplay starts, most cached pipelines should be compiled.
+  // Asynchronous, completing while the guest boots. Not blocking: the launch
+  // runs on the UI thread, which this call's blocking mode would park on the
+  // command processor while the command processor still needs it serviced.
   if (graphics_system_) {
     on_shader_storage_initialization(true);
     graphics_system_->InitializeShaderStorage(
-        cache_root_, title_id_.value(), false/*,
-        [this]() { on_shader_storage_initialization(false); }*/);
-      on_shader_storage_initialization(false);
+        cache_root_, title_id_.value(), false,
+        [this]() { on_shader_storage_initialization(false); });
   }
 
   auto main_thread = kernel_state_->LaunchModule(module);

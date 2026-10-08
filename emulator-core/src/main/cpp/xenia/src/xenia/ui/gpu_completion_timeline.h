@@ -63,6 +63,15 @@ class GPUCompletionTimeline {
     if (GetCompletedSubmissionFromLastUpdate() >= awaited_submission) {
       return true;
     }
+    // Some Vulkan implementations backed by KGSL don't provide a genuinely
+    // nonblocking fence-status query for pending work. In the experimental
+    // bounded-poll mode, wait for exactly the requested submission instead of
+    // first walking the opportunistic completion-poll path. The implementation
+    // must publish the completion observed by the explicit wait.
+    if (CompletionPollMayBlock()) {
+      AwaitSubmissionImpl(awaited_submission);
+      return GetCompletedSubmissionFromLastUpdate() >= awaited_submission;
+    }
     if (UpdateAndGetCompletedSubmission() < awaited_submission) {
       AwaitSubmissionImpl(awaited_submission);
     }
@@ -97,6 +106,11 @@ class GPUCompletionTimeline {
   // The implementation may call `SetCompletedSubmission`, but is not required
   // to.
   virtual void AwaitSubmissionImpl(uint64_t awaited_submission) = 0;
+
+  // Whether an opportunistic completion poll may itself block on pending GPU
+  // work. Backends keep the historical poll-before/poll-after wait sequence by
+  // default; Vulkan overrides this only for the explicit experimental mode.
+  virtual bool CompletionPollMayBlock() const { return false; }
 
  private:
   uint64_t upcoming_submission_ = 1;

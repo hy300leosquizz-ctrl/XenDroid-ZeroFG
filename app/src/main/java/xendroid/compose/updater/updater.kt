@@ -56,7 +56,8 @@ sealed class UpdateResult {
 
 interface GithubApi {
 
-    @GET("repos/rfandango/XenDroid/releases/latest")
+    // XenDroid-ZeroFG's own releases: XenDroid's would offer a build without ZeroFG.
+    @GET("repos/hy300leosquizz-ctrl/XenDroid-ZeroFG/releases/latest")
     suspend fun latestRelease(): GithubRelease
 }
 
@@ -115,20 +116,22 @@ suspend fun checkForUpdates(): UpdateResult {
 
     Log.d("Updater", "Release tag: ${release.tagName}")
 
-    val currentHash = BuildConfig.VERSION_NAME
+    // Releases are tagged vX.Y.Z; the app's versionName is X.Y.Z, plus -<commit>
+    // on CI builds.
+    val currentVersion = BuildConfig.VERSION_NAME.substringBefore('-')
 
-    Log.d("Updater", "Current: $currentHash")
+    Log.d("Updater", "Current: $currentVersion")
 
-    val latestHash = release.tagName
-        .removePrefix("XenDroid-")
+    val latestVersion = release.tagName
+        .removePrefix("v")
         .trim()
 
-    Log.d("Updater", "Latest: $latestHash")
+    Log.d("Updater", "Latest: $latestVersion")
 
-    return if (currentHash != latestHash) {
+    return if (currentVersion != latestVersion) {
         UpdateResult.Available(release)
     } else {
-        UpdateResult.Latest(currentHash)
+        UpdateResult.Latest(BuildConfig.VERSION_NAME)
     }
 }
 
@@ -163,7 +166,7 @@ fun UpdateDialog(
             .verticalScroll(rememberScrollState())
             ) {
                 Text(
-                    "A new update for XenDroid is available."
+                    "A new version of XenDroid-ZeroFG is available."
                 )
 
                 Spacer(modifier = Modifier.height(16.dp))

@@ -4,6 +4,7 @@
 #include <android/log.h>
 #include <fstream>
 #include <jni.h>
+#include <cstdint>
 #include <thread>
 
 #define LOG_TAG "Emulator_Config"

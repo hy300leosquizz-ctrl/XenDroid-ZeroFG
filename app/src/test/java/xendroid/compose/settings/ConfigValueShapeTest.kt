@@ -20,6 +20,16 @@ class ConfigValueShapeTest {
         assertEquals("-3", ConfigValueShape.int(-3))
     }
 
+    @Test fun native_double_inference_matches_the_writer() {
+        assertTrue(ConfigValueShape.nativeStoresAsDouble("0.20"))
+        assertTrue(ConfigValueShape.nativeStoresAsDouble("0.20t"))   // stof takes a prefix
+        assertTrue(ConfigValueShape.nativeStoresAsDouble(".5"))
+        assertFalse(ConfigValueShape.nativeStoresAsDouble("20"))     // an int, not a double
+        assertFalse(ConfigValueShape.nativeStoresAsDouble("g020"))
+        assertFalse(ConfigValueShape.nativeStoresAsDouble("1.2.3"))  // two dots
+        assertFalse(ConfigValueShape.nativeStoresAsDouble("anchor_motion"))
+    }
+
     @Test fun double_always_carries_exactly_one_dot() {
         assertEquals(1, ConfigValueShape.double(1.5).count { it == '.' })
         assertEquals("2.0", ConfigValueShape.double(2.0))   // never "2"

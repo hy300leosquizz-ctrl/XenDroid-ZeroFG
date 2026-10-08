@@ -11,6 +11,7 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/frame_stats.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/ui/window.h"
@@ -369,6 +370,8 @@ bool Presenter::RefreshGuestOutput(
     uint32_t frontbuffer_width, uint32_t frontbuffer_height,
     uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
+  SourceBoundaryInflightScope refresh_inflight_scope(
+      SourceBoundaryInflightScope::Kind::kRefresh);
   GuestOutputProperties& writable_properties =
       guest_output_properties_[guest_output_mailbox_writable_];
   writable_properties.frontbuffer_width = frontbuffer_width;
@@ -384,6 +387,7 @@ bool Presenter::RefreshGuestOutput(
       // If failed to refresh, don't send the currently writable image to the
       // mailbox as it may be in an undefined state. Don't disable the guest
       // output either though because the failure may be something transient.
+      xe::RecordSourcePublishError();
       return false;
     }
     guest_output_active_last_refresh_ = true;
@@ -402,6 +406,8 @@ bool Presenter::RefreshGuestOutput(
   // after switching from UI thread painting to doing it in the guest output
   // thread, will immediately recover to having the latest frame always sent to
   // the host present call on the CPU and all frames reaching a present call).
+  writable_properties.source_publication =
+      xe::PrepareSourcePublicationTelemetry();
   uint32_t last_acquired_and_ready =
       guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
   // Desired acquired = current acquired (changed only by the consumers).
@@ -412,6 +418,20 @@ bool Presenter::RefreshGuestOutput(
       last_acquired_and_ready,
       (last_acquired_and_ready & 3) | (guest_output_mailbox_writable_ << 2),
       std::memory_order_acq_rel, std::memory_order_relaxed)) {
+  }
+  const bool replaced_before_consume =
+      (last_acquired_and_ready & 3) !=
+      ((last_acquired_and_ready >> 2) & 3);
+  const xe::SourcePublicationTelemetry source_publication =
+      writable_properties.source_publication;
+  xe::CommitSourcePublicationTelemetry(source_publication,
+                                       replaced_before_consume);
+  bool backend_drives_presentation = false;
+  if (IsGuestOutputPresentationBackendActive()) {
+    backend_drives_presentation = OnGuestOutputPublished(
+        guest_output_mailbox_writable_, is_active,
+        source_publication.source_id, source_publication.issue_time_ns,
+        source_publication.publish_time_ns, writable_properties);
   }
   // Now, it's known that `ready == writable` on the host presentation side.
   // Take the next `writable` with this assumption about its current value in
@@ -438,6 +458,11 @@ bool Presenter::RefreshGuestOutput(
   // Count this frame so the UI thread can tell the guest output is driving the
   // paint cadence and UI drawers don't request extra repaints on top of it.
   guest_output_refresh_count_.fetch_add(1, std::memory_order_relaxed);
+
+  if (backend_drives_presentation) {
+    OnGuestOutputPublicationCommitted();
+    return true;
+  }
 
   // Trigger the presentation on the host.
   PaintResult paint_result = PaintResult::kNotPresented;
@@ -616,7 +641,8 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
 std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
     uint32_t& mailbox_index_or_max_if_inactive_out,
     GuestOutputProperties* properties_out,
-    GuestOutputPaintConfig* paint_config_out) {
+    GuestOutputPaintConfig* paint_config_out,
+    bool* consumed_new_publication_out) {
   if (paint_config_out) {
     // Get the up-to-date guest output paint configuration settings set by the
     // UI thread.
@@ -655,6 +681,16 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
     desired_acquired_and_ready =
         (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
   }
+  const bool consumed_new_publication =
+      old_acquired_and_ready != desired_acquired_and_ready;
+  if (consumed_new_publication_out) {
+    *consumed_new_publication_out = consumed_new_publication;
+    if (consumed_new_publication) {
+      // Only presentation consumers request this boundary marker. Capture
+      // consumers may acquire the mailbox too, but don't deliver a Real.
+      xe::RecordSourceConsumedNew();
+    }
+  }
   uint32_t mailbox_index = desired_acquired_and_ready & 3;
   // Give the current acquired image to the caller, or UINT32_MAX if it's
   // inactive.
@@ -666,6 +702,87 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
     *properties_out = properties;
   }
   return std::move(consumer_lock);
+}
+
+Presenter::GuestOutputPresentationGeometry
+Presenter::CalculateGuestOutputPresentationGeometry(
+    uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
+    uint32_t output_surface_width, uint32_t output_surface_height,
+    bool allow_overscan_cutoff, bool present_letterbox,
+    int32_t present_safe_area_x, int32_t present_safe_area_y) {
+  GuestOutputPresentationGeometry geometry;
+  if (!display_aspect_ratio_x || !display_aspect_ratio_y ||
+      !output_surface_width || !output_surface_height) {
+    return geometry;
+  }
+
+  // Multiplication-division rounding to the nearest. This is the same policy
+  // historically used by GetGuestOutputPaintFlow.
+  auto rescale_unsigned = [](uint32_t value, uint32_t new_scale,
+                             uint32_t old_scale) -> uint32_t {
+    return uint32_t((uint64_t(value) * new_scale + (old_scale >> 1)) /
+                    old_scale);
+  };
+
+  if (uint64_t(output_surface_width) * display_aspect_ratio_y >
+      uint64_t(output_surface_height) * display_aspect_ratio_x) {
+    const uint32_t safe_area =
+        allow_overscan_cutoff && present_safe_area_y > 0 &&
+                present_safe_area_y < 100
+            ? uint32_t(present_safe_area_y)
+            : 100;
+    geometry.output_height =
+        rescale_unsigned(output_surface_width, display_aspect_ratio_y,
+                         display_aspect_ratio_x);
+    bool letterbox = false;
+    if (geometry.output_height * safe_area > output_surface_height * 100) {
+      geometry.output_height =
+          rescale_unsigned(output_surface_height, 100, safe_area);
+      letterbox = true;
+    }
+    if (letterbox && present_letterbox) {
+      geometry.output_width = rescale_unsigned(
+          output_surface_height * 100, display_aspect_ratio_x,
+          display_aspect_ratio_y * safe_area);
+      geometry.output_x =
+          (int32_t(output_surface_width) - int32_t(geometry.output_width)) / 2;
+      geometry.letterbox_active = true;
+    } else {
+      geometry.output_width = output_surface_width;
+    }
+    geometry.output_y =
+        (int32_t(output_surface_height) - int32_t(geometry.output_height)) / 2;
+  } else {
+    const uint32_t safe_area =
+        allow_overscan_cutoff && present_safe_area_x > 0 &&
+                present_safe_area_x < 100
+            ? uint32_t(present_safe_area_x)
+            : 100;
+    geometry.output_width =
+        rescale_unsigned(output_surface_height, display_aspect_ratio_x,
+                         display_aspect_ratio_y);
+    bool letterbox = false;
+    if (geometry.output_width * safe_area > output_surface_width * 100) {
+      geometry.output_width =
+          rescale_unsigned(output_surface_width, 100, safe_area);
+      letterbox = true;
+    }
+    if (letterbox && present_letterbox) {
+      geometry.output_height = rescale_unsigned(
+          output_surface_width * 100, display_aspect_ratio_y,
+          display_aspect_ratio_x * safe_area);
+      geometry.output_y =
+          (int32_t(output_surface_height) - int32_t(geometry.output_height)) /
+          2;
+      geometry.letterbox_active = true;
+    } else {
+      geometry.output_height = output_surface_height;
+    }
+    geometry.output_x =
+        (int32_t(output_surface_width) - int32_t(geometry.output_width)) / 2;
+  }
+  geometry.valid = geometry.output_width && geometry.output_height;
+  return geometry;
 }
 
 Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
@@ -719,99 +836,23 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
                    old_scale);
   };
 
-  // Final output location and dimensions.
-  // All host location calculations are DPI-independent, conceptually depending
-  // only on the aspect ratios, not the absolute values.
-  uint32_t output_width, output_height;
-  if (uint64_t(surface_width_in_paint_connection_) *
-          properties.display_aspect_ratio_y >
-      uint64_t(surface_height_in_paint_connection_) *
-          properties.display_aspect_ratio_x) {
-    // The window is wider that the source - crop along Y to preserve the aspect
-    // ratio while stretching throughout the entire surface's width, then limit
-    // the Y cropping via letterboxing or stretching along X.
-    uint32_t present_safe_area;
-    if (config.GetAllowOverscanCutoff() && cvars::present_safe_area_y > 0 &&
-        cvars::present_safe_area_y < 100) {
-      present_safe_area = uint32_t(cvars::present_safe_area_y);
-    } else {
-      present_safe_area = 100;
-    }
-    // Scale the desired width by the H:W aspect ratio (inverse of W:H) to get
-    // the height.
-    output_height = rescale_unsigned(surface_width_in_paint_connection_,
-                                     properties.display_aspect_ratio_y,
-                                     properties.display_aspect_ratio_x);
-    bool letterbox = false;
-    if (output_height * present_safe_area >
-        surface_height_in_paint_connection_ * 100) {
-      // Don't crop out more than the safe area margin - letterbox or stretch.
-      output_height = rescale_unsigned(surface_height_in_paint_connection_, 100,
-                                       present_safe_area);
-      letterbox = true;
-    }
-    if (letterbox && cvars::present_letterbox) {
-      output_width = rescale_unsigned(
-          surface_height_in_paint_connection_ * 100,
+  // Final output location and dimensions. This policy is shared with
+  // independent presenters; only the backend-specific drawing differs.
+  const GuestOutputPresentationGeometry geometry =
+      CalculateGuestOutputPresentationGeometry(
           properties.display_aspect_ratio_x,
-          properties.display_aspect_ratio_y * present_safe_area);
-      // output_width might have been rounded up already by rescale_unsigned, so
-      // rounding down in this division.
-      flow.output_x = (int32_t(surface_width_in_paint_connection_) -
-                       int32_t(output_width)) /
-                      2;
-    } else {
-      output_width = surface_width_in_paint_connection_;
-      flow.output_x = 0;
-    }
-    // output_height might have been rounded up already by rescale_unsigned, so
-    // rounding down in this division.
-    flow.output_y = (int32_t(surface_height_in_paint_connection_) -
-                     int32_t(output_height)) /
-                    2;
-  } else {
-    // The window is taller that the source - crop along X to preserve the
-    // aspect ratio while stretching throughout the entire surface's height,
-    // then limit the X cropping via letterboxing or stretching along Y.
-    uint32_t present_safe_area;
-    if (config.GetAllowOverscanCutoff() && cvars::present_safe_area_x > 0 &&
-        cvars::present_safe_area_x < 100) {
-      present_safe_area = uint32_t(cvars::present_safe_area_x);
-    } else {
-      present_safe_area = 100;
-    }
-    // Scale the desired height by the W:H aspect ratio to get the width.
-    output_width = rescale_unsigned(surface_height_in_paint_connection_,
-                                    properties.display_aspect_ratio_x,
-                                    properties.display_aspect_ratio_y);
-    bool letterbox = false;
-    if (output_width * present_safe_area >
-        surface_width_in_paint_connection_ * 100) {
-      // Don't crop out more than the safe area margin - letterbox or stretch.
-      output_width = rescale_unsigned(surface_width_in_paint_connection_, 100,
-                                      present_safe_area);
-      letterbox = true;
-    }
-    if (letterbox && cvars::present_letterbox) {
-      output_height = rescale_unsigned(
-          surface_width_in_paint_connection_ * 100,
           properties.display_aspect_ratio_y,
-          properties.display_aspect_ratio_x * present_safe_area);
-      // output_height might have been rounded up already by rescale_unsigned,
-      // so rounding down in this division.
-      flow.output_y = (int32_t(surface_height_in_paint_connection_) -
-                       int32_t(output_height)) /
-                      2;
-    } else {
-      output_height = surface_height_in_paint_connection_;
-      flow.output_y = 0;
-    }
-    // output_width might have been rounded up already by rescale_unsigned, so
-    // rounding down in this division.
-    flow.output_x =
-        (int32_t(surface_width_in_paint_connection_) - int32_t(output_width)) /
-        2;
+          surface_width_in_paint_connection_,
+          surface_height_in_paint_connection_, config.GetAllowOverscanCutoff(),
+          cvars::present_letterbox, cvars::present_safe_area_x,
+          cvars::present_safe_area_y);
+  if (!geometry.valid) {
+    return flow;
   }
+  uint32_t output_width = geometry.output_width;
+  uint32_t output_height = geometry.output_height;
+  flow.output_x = geometry.output_x;
+  flow.output_y = geometry.output_y;
 
   // Convert the location from surface pixels (which have 1:1 aspect ratio
   // relatively to the physical display) to render target pixels (the render
@@ -1339,17 +1380,76 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
       if (surface_paint_connection_was_optimal_at_successful_paint_) {
         surface_paint_connection_state_ =
             SurfacePaintConnectionState::kConnectedOutdated;
+        xe::RequestFrameTelemetryReset();
       }
       break;
     case PaintResult::kNotPresentedConnectionOutdated:
       surface_paint_connection_state_ =
           SurfacePaintConnectionState::kConnectedOutdated;
+      xe::RequestFrameTelemetryReset();
+      break;
+    case PaintResult::kGpuLostExternally:
+    case PaintResult::kGpuLostResponsible:
+      xe::RequestFrameTelemetryReset();
       break;
     default:
       // Another issue not directly related to the surface connection.
       break;
   }
   return result;
+}
+
+Presenter::PaintResult Presenter::PaintGuestOutputFromExternalThread() {
+  std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
+  if (paint_mode_ == PaintMode::kNone ||
+      surface_paint_connection_state_ !=
+          SurfacePaintConnectionState::kConnectedPaintable) {
+    return PaintResult::kNotPresented;
+  }
+  PaintResult result = PaintAndPresent(false);
+  if (surface_paint_connection_state_ ==
+      SurfacePaintConnectionState::kConnectedOutdated) {
+    RequestPaintOrConnectionRecoveryViaWindow(true);
+  }
+  return result;
+}
+
+Presenter::PaintResult Presenter::TryPaintGuestOutputFromExternalThread(
+    bool& lock_busy_out) {
+  lock_busy_out = false;
+  std::unique_lock<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_,
+                                                     std::try_to_lock);
+  if (!paint_mode_mutex_lock.owns_lock()) {
+    lock_busy_out = true;
+    return PaintResult::kNotPresented;
+  }
+  if (paint_mode_ == PaintMode::kNone ||
+      surface_paint_connection_state_ !=
+          SurfacePaintConnectionState::kConnectedPaintable) {
+    return PaintResult::kNotPresented;
+  }
+  PaintResult result = PaintAndPresent(false);
+  if (surface_paint_connection_state_ ==
+      SurfacePaintConnectionState::kConnectedOutdated) {
+    RequestPaintOrConnectionRecoveryViaWindow(true);
+  }
+  return result;
+}
+
+bool Presenter::RequestUIThreadPaintFromExternalThread() {
+  std::unique_lock<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_,
+                                                     std::try_to_lock);
+  if (!paint_mode_mutex_lock.owns_lock() ||
+      paint_mode_ == PaintMode::kNone) {
+    return false;
+  }
+  return RequestPaintOrConnectionRecoveryViaWindow(true);
+}
+
+Presenter::GuestOutputPaintConfig
+Presenter::GetGuestOutputPaintConfigForExternalThread() {
+  std::lock_guard<std::mutex> config_lock(guest_output_paint_config_mutex_);
+  return guest_output_paint_config_;
 }
 
 void Presenter::HandleUIDrawersChangeFromUIThread(bool drawers_were_empty) {

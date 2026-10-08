@@ -59,6 +59,7 @@ fun GameLibraryScreen(
     onOpenGamePatches: (titleId: String, gameName: String) -> Unit,
     onOpenContentManager: (titleId: String, gameName: String) -> Unit,
     onOpenInstallContent: () -> Unit,
+    onInstallFromDisc: (String) -> Unit,
     compressVm: GameCompressViewModel,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -67,6 +68,8 @@ fun GameLibraryScreen(
     var updateResult by remember { mutableStateOf<UpdateResult?>(null) }
 
     var pendingGame by remember { mutableStateOf<Game?>(null) }
+    // A disc whose content is not installed yet; the launch waits on the answer.
+    var pendingDiscInstall by remember { mutableStateOf<Pair<Game, Int>?>(null) }
     var compressConfirmFor by remember { mutableStateOf<Game?>(null) }
     val compressState by compressVm.state.collectAsStateWithLifecycle()
     val titleIdState by viewModel.titleIdState.collectAsStateWithLifecycle()
@@ -206,12 +209,15 @@ fun GameLibraryScreen(
                         games = s.games,
                         viewModel = viewModel,
                         onLaunch = { game ->
-                            runCatching {
-                                // Reap any stale/orphaned :emu first (single-shot core). The new
-                                // :emu links itself to this process by binding MainAliveService,
-                                // so nothing rides on the Intent.
-                                EmuProcessLink.killStaleEmu(context)
-                                context.startActivity(viewModel.buildLaunchIntent(game))
+                            scope.launch {
+                                // A mandatory-install disc is still bootable, so this asks
+                                // rather than diverting the launch on its own.
+                                val pending = viewModel.uninstalledDiscContent(game)
+                                if (pending.isNotEmpty()) {
+                                    pendingDiscInstall = game to pending.size
+                                } else {
+                                    launchGame(context, viewModel, game)
+                                }
                             }
                         },
                         onLongPress = { pendingGame = it },
@@ -244,6 +250,29 @@ fun GameLibraryScreen(
         }
 
         null -> {}
+    }
+
+    pendingDiscInstall?.let { (game, count) ->
+        AlertDialog(
+            onDismissRequest = { pendingDiscInstall = null },
+            title = { Text("Install disc") },
+            text = {
+                Text("This disc carries $count content package(s) the game installs before " +
+                     "it will run. Install them now, or boot the disc anyway?")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingDiscInstall = null
+                    onInstallFromDisc(game.launchUri)
+                }) { Text("Install") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    pendingDiscInstall = null
+                    launchGame(context, viewModel, game)
+                }) { Text("Boot anyway") }
+            },
+        )
     }
 
     pendingGame?.let { game ->
@@ -565,4 +594,13 @@ private fun formatBytes(b: Long): String {
     var i = -1
     do { v /= 1024.0; i++ } while (v >= 1024.0 && i < u.lastIndex)
     return "%.1f %s".format(v, u[i])
+}
+
+/** Reap any stale/orphaned :emu first (single-shot core). The new :emu links itself to the
+ *  launcher by binding MainAliveService, so nothing rides on the Intent. */
+private fun launchGame(context: Context, viewModel: GameLibraryViewModel, game: Game) {
+    runCatching {
+        EmuProcessLink.killStaleEmu(context)
+        context.startActivity(viewModel.buildLaunchIntent(game))
+    }
 }

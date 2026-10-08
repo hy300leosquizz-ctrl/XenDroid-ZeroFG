@@ -118,7 +118,14 @@ private fun ListRow(host: SettingsHost, s: Setting.ListChoice, modified: Boolean
     if (showDialog) {
         val listState = rememberLazyListState()
         val selectedIndex = s.options.indexOfFirst { it.value == currentValue }
-        LaunchedEffect(Unit) { if (selectedIndex > 0) listState.scrollToItem(selectedIndex) }
+        // Keep every choice in a short selector visible. Jumping a three-item
+        // list to its selected tail can place earlier choices (notably ZeroFG
+        // "Off") above a constrained dialog viewport with no visual cue.
+        LaunchedEffect(Unit) {
+            if (s.options.size > 6 && selectedIndex > 0) {
+                listState.scrollToItem(selectedIndex)
+            }
+        }
         AlertDialog(
             onDismissRequest = { showDialog = false },
             title = { Text(s.title) },

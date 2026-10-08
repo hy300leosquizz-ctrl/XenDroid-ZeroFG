@@ -19,6 +19,14 @@
 #include "xenia/kernel/xthread.h"
 #include "xenia/xbox.h"
 
+DEFINE_bool(network_enabled, true,
+            "Let titles open host sockets. The XNet address and session layer "
+            "is stubbed, so guest traffic cannot reach a peer, but titles that "
+            "do not check for socket creation failure crash outright when this "
+            "is off. Turn it off only for titles that block indefinitely on a "
+            "socket that never answers.",
+            "Kernel");
+
 #ifdef XE_PLATFORM_WIN32
 // NOTE: must be included last as it expects windows.h to already be included.
 #ifndef _WINSOCK_DEPRECATED_NO_WARNINGS
@@ -667,6 +675,12 @@ dword_result_t NetDll_socket_entry(dword_t caller, dword_t af, dword_t type,
                                    dword_t protocol) {
   XELOGI("NetDll_socket: af={}, type={}, protocol={}", af.value(), type.value(),
          protocol.value());
+
+  if (!cvars::network_enabled) {
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSAENETDOWN));
+    XELOGI("NetDll_socket: refused, network_enabled is off");
+    return -1;
+  }
 
   XSocket* socket = new XSocket(kernel_state());
   X_STATUS result = socket->Initialize(XSocket::AddressFamily((uint32_t)af),

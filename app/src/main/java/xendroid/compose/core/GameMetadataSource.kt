@@ -97,6 +97,38 @@ class GameMetadataSource {
         }
     }
 
+    /** One installable package inside a disc image (see [listDiscContent]). */
+    data class DiscContent(
+        val innerPath: String,
+        val displayName: String,
+        val titleId: String?,
+        val contentType: Int,
+        val size: Long,
+    )
+
+    /** Packages a disc image carries under \content\ -- what a mandatory-install title
+     *  (GTA V and friends) expects on the HDD before it will run. Empty for an ordinary
+     *  disc. Off-main: walks the image. */
+    fun listDiscContent(path: String): List<DiscContent> {
+        val emu = EmulatorRuntime.emulator ?: return emptyList()
+        return try {
+            emu.list_disc_content(path).orEmpty().map { item ->
+                DiscContent(
+                    innerPath = item.innerPath,
+                    displayName = item.displayName ?: "",
+                    titleId = item.titleId.takeIf { it != 0 }?.let { "%08X".format(it) },
+                    contentType = item.contentType,
+                    size = item.size,
+                )
+            }
+        } catch (t: RuntimeException) {
+            Log.w("GameMetadataSource", "disc content listing failed for $path", t)
+            emptyList()
+        } catch (t: LinkageError) {
+            warnMissingNative("list_disc_content", t); emptyList()
+        }
+    }
+
     /** GOD container header read from a real path (title + icon + title id). */
     fun readGodPath(path: String): GodMeta? {
         val emu = EmulatorRuntime.emulator ?: return null

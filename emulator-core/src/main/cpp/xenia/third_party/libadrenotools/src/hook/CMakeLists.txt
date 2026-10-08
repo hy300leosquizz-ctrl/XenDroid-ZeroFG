@@ -25,3 +25,10 @@ target_compile_options(gsl_alloc_hook PRIVATE -Wall -Wextra)
 target_link_options(gsl_alloc_hook PRIVATE -z global)
 target_link_libraries(gsl_alloc_hook hook_impl)
 set_target_properties(gsl_alloc_hook PROPERTIES CXX_VISIBILITY_PRESET hidden)
+
+add_library(kgsl_priority_hook SHARED kgsl_priority_hook.c)
+
+target_compile_options(kgsl_priority_hook PRIVATE -Wall -Wextra)
+target_link_options(kgsl_priority_hook PRIVATE -z global)
+target_link_libraries(kgsl_priority_hook hook_impl)
+set_target_properties(kgsl_priority_hook PROPERTIES CXX_VISIBILITY_PRESET hidden)

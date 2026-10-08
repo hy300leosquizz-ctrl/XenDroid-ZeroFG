@@ -9,13 +9,21 @@
 
 #ifndef XENIA_CPU_CPU_FLAGS_H_
 #define XENIA_CPU_CPU_FLAGS_H_
+#include <cstdint>
+#include <string>
+
 #include "xenia/base/cvar.h"
 
 DECLARE_string(cpu);
 
 DECLARE_string(load_module_map);
 
+DECLARE_string(dump_functions_at);
 DECLARE_bool(disassemble_functions);
+
+DECLARE_string(log_guest_calls_at);
+DECLARE_string(log_guest_call_fields);
+DECLARE_uint32(log_guest_calls_limit);
 
 DECLARE_bool(trace_functions);
 DECLARE_bool(trace_function_coverage);
@@ -36,5 +44,15 @@ DECLARE_string(break_condition_op);
 DECLARE_bool(break_condition_truncate);
 
 DECLARE_bool(break_on_debugbreak);
+
+namespace xe {
+namespace cpu {
+
+// Matches an address against a comma-separated list of hex guest addresses,
+// tolerating "0x" and "sub_" prefixes.
+bool GuestAddressInList(const std::string& list, uint32_t address);
+
+}  // namespace cpu
+}  // namespace xe
 
 #endif  // XENIA_CPU_CPU_FLAGS_H_

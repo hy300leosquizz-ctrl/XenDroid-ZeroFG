@@ -124,7 +124,9 @@ class GameMetadataCache(cacheDir: File) {
 
     companion object {
         private const val TAG = "GameMetadataCache"
-        const val FILE_NAME = "game_metadata_v4.json"
+        // v5: v4 caches hold add-on content the deep scan published as games before the
+        // content-type gate; a hit would resurrect it without ever reclassifying.
+        const val FILE_NAME = "game_metadata_v5.json"
 
         /**
          * PURE, side-effect-free HIT/MISS decision (no SAF/JNI/IO) so it is unit-testable.

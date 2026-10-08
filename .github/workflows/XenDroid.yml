@@ -4,7 +4,9 @@ on:
     branches: main
     
   push:
-    branches: main 
+    branches: main
+    # A version tag (v1.0.0) publishes a GitHub release with the signed APK.
+    tags: ['v*']
 
 permissions:
   contents: write
@@ -216,12 +218,18 @@ jobs:
     ##################################################################
     - name: Compute SHA
       id: vars
-      run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+      run: |
+        echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        if [ "${{ github.ref_type }}" = "tag" ]; then
+          echo "apk_name=XenDroid-ZeroFG-${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        else
+          echo "apk_name=XenDroid-ZeroFG_$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        fi
 
     - name: Rename APK
       run: |
         APK=$(ls app/build/outputs/apk/release/*.apk)
-        mv "$APK" "XenDroid_Release_${{ steps.vars.outputs.sha_short }}.apk"
+        mv "$APK" "${{ steps.vars.outputs.apk_name }}.apk"
 
     ##################################################################
     # Delete old artifacts if needed
@@ -261,17 +269,16 @@ jobs:
           }
 
     - name: Upload artifact
-      if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+      if: github.ref_type != 'tag'
       uses: actions/upload-artifact@v4
       with:
-        name: XenDroid_Release_${{ steps.vars.outputs.sha_short }}
-        path: XenDroid_Release_${{ steps.vars.outputs.sha_short }}.apk
+        name: ${{ steps.vars.outputs.apk_name }}
+        path: ${{ steps.vars.outputs.apk_name }}.apk
 
     - name: Create GitHub Release
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      if: github.event_name == 'push' && github.ref_type == 'tag'
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: XenDroid-${{ steps.vars.outputs.sha_short }}
-        name: XenDroid ${{ steps.vars.outputs.sha_short }}
-        generate_release_notes: true
-        files: XenDroid_Release_${{ steps.vars.outputs.sha_short }}.apk
+        tag_name: ${{ github.ref_name }}
+        name: XenDroid-ZeroFG ${{ github.ref_name }}
+        files: ${{ steps.vars.outputs.apk_name }}.apk

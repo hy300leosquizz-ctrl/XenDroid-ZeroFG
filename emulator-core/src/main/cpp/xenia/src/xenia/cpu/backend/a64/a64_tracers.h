@@ -40,6 +40,10 @@ void SetTraceFuncEnabled(bool value);
 
 void TraceFunctionEntry(void* raw_context, uint64_t function_address);
 void TraceFunctionReturn(void* raw_context, uint64_t function_address);
+
+// Emitted only for the addresses named by log_guest_calls_at.
+void LogGuestCallEntry(void* raw_context, uint64_t function_address);
+void LogGuestCallReturn(void* raw_context, uint64_t function_address);
 void TraceString(void* raw_context, const char* str);
 
 void TraceContextLoadI8(void* raw_context, uint64_t offset, uint8_t value);

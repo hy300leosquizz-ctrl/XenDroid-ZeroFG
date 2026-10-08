@@ -8,6 +8,8 @@
  */
 
 #include "xenia/kernel/xam/xam_ui.h"
+
+#include <cstdlib>
 #include "xenia/app/emulator_window.h"
 #include "xenia/base/png_utils.h"
 #include "xenia/base/system.h"
@@ -787,9 +789,16 @@ dword_result_t XamShowDeviceSelectorUI_entry(
 DECLARE_XAM_EXPORT1(XamShowDeviceSelectorUI, kUI, kImplemented);
 
 void XamShowDirtyDiscErrorUI_entry(dword_t user_index) {
+  // The title has decided the disc is unreadable; on Android (headless) this used to be
+  // a silent exit(1), which runs static destructors on a guest thread while every
+  // emulator thread is live and aborts inside them, leaving no log line at all.
+  XELOGE(
+      "XamShowDirtyDiscErrorUI: the title reported a dirty disc and is "
+      "terminating. Usually an unimplemented disc IO call (sector info, volume "
+      "device type, dismount) rather than a real media error.");
   if (cvars::headless) {
-    assert_always();
-    exit(1);
+    // quick_exit skips the static destructors that turned this into an abort.
+    std::quick_exit(1);
     return;
   }
 
@@ -805,8 +814,7 @@ void XamShowDirtyDiscErrorUI_entry(dword_t user_index) {
       new MessageBoxDialog(imgui_drawer, input_system, title, desc, {"OK"}, 0),
       [](MessageBoxDialog*) -> X_RESULT { return X_ERROR_SUCCESS; }, 0);
   // This is death, and should never return.
-  // TODO(benvanik): cleaner exit.
-  exit(1);
+  std::quick_exit(1);
 }
 DECLARE_XAM_EXPORT1(XamShowDirtyDiscErrorUI, kUI, kImplemented);
 

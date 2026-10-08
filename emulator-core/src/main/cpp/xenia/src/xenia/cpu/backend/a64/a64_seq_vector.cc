@@ -864,6 +864,14 @@ struct VECTOR_DENORMFLUSH
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     int s = SrcVReg(e, i.src1, 0);
     int d = i.dest.reg().getIdx();
+    // Consumers are VMX-mode float ops, which run under FPCR.FZ and so
+    // flush denormals in hardware.
+    if (e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
+      if (d != s) {
+        e.mov(VReg(d).b16, VReg(s).b16);
+      }
+      return;
+    }
     // Extract exponent bits; if exponent == 0 and mantissa != 0, it's denormal.
     // Replace with signed zero (keep sign bit).
     // Mask: exponent = bits 30:23 of each float.

@@ -20,7 +20,7 @@ The Gradle build produces two modules:
 | Android SDK | platform 35        | `sdk.dir` in `local.properties`. |
 | Android NDK | 29.0.14206865      | Pinned in `emulator-core/build.gradle` (`ndkVersion`). |
 | CMake       | 3.30.3             | Pinned in `emulator-core/build.gradle` (`cmake { version '3.30.3' }`) and selected via `cmake.dir`. Uses Ninja. |
-| Gradle      | 8.11.1             | Provided by the wrapper (`./gradlew` / `gradlew.bat`); the distribution is SHA-256 pinned in `gradle/wrapper/gradle-wrapper.properties`. |
+| Gradle      | 8.13               | Provided by the wrapper (`./gradlew` / `gradlew.bat`); the distribution is SHA-256 pinned in `gradle/wrapper/gradle-wrapper.properties`. |
 | Python      | 3.x                | Runs on the **build host**; drives the shader compile step. |
 | SPIR-V tools| glslang + SPIRV-Tools | `glslangValidator`, `spirv-opt`, `spirv-dis` on the build host (or under `$VULKAN_SDK/bin`). Validated at configure time. |
 
@@ -135,7 +135,7 @@ gradlew.bat :app:assembleDebug
 ./gradlew :app:installDebug
 ```
 
-First build downloads Gradle 8.11.1 (SHA-256 verified) and compiles the full
+First build downloads Gradle 8.13 (SHA-256 verified) and compiles the full
 native tree — ~8–9 min cold. The APK lands in
 `app/build/outputs/apk/debug/`.
 

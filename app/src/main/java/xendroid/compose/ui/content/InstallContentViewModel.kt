@@ -45,6 +45,7 @@ class InstallContentViewModel(
             is PreCheck.Overwrite ->
                 _state.value = ContentInstallState.ConfirmOverwrite(srcPath, pre.name)
             is PreCheck.Copy -> runCopy(srcPath, pre.name, pre.gamesDir)
+            is PreCheck.Disc -> runDiscInstall(srcPath, pre.items)
             is PreCheck.Ok -> runInstall(srcPath, pre.name, pre.label)
         }
     }
@@ -77,6 +78,8 @@ class InstallContentViewModel(
 
     private sealed interface PreCheck {
         data class Ok(val name: String, val label: String) : PreCheck
+        /** A disc image carrying installable packages (a mandatory-install title). */
+        data class Disc(val items: List<GameMetadataSource.DiscContent>) : PreCheck
         data class Overwrite(val name: String) : PreCheck
         /** Full game to copy into [gamesDir] (no existing container in the way). */
         data class Copy(val name: String, val gamesDir: File) : PreCheck
@@ -90,7 +93,7 @@ class InstallContentViewModel(
         val src = File(srcPath)
         if (!src.isFile) return PreCheck.Reject("Couldn't open the package file.")
         val meta = metadata.readContentHeader(srcPath)
-            ?: return PreCheck.Reject("Not a recognized content package (need CON/LIVE/PIRS).")
+            ?: return validateDisc(srcPath)
         val name = meta.displayName.ifBlank { src.name }
         // A full game (XBLA/arcade, GoD, ...) is COPIED into the games folder as a
         // container so the library boots it; add-on content is installed natively below.
@@ -118,6 +121,55 @@ class InstallContentViewModel(
         }
         storageShortfallOn(gamesDir, src.length())?.let { return PreCheck.Reject(it) }
         return if (dest.exists()) PreCheck.Overwrite(name) else PreCheck.Copy(name, gamesDir)
+    }
+
+    /** A picked file that is not a package may still be a disc image whose \content\ tree
+     *  holds the install payload; anything else is rejected as before. */
+    private fun validateDisc(srcPath: String): PreCheck {
+        val items = metadata.listDiscContent(srcPath)
+        if (items.isEmpty()) {
+            return PreCheck.Reject("Not a recognized content package (need CON/LIVE/PIRS).")
+        }
+        storageShortfall(items.sumOf { it.size })?.let { return PreCheck.Reject(it) }
+        return PreCheck.Disc(items)
+    }
+
+    /** Installs every package on the disc, one at a time. Each is staged out of the image
+     *  natively, so progress is reported per package rather than across the whole set. */
+    private suspend fun runDiscInstall(
+        discPath: String,
+        items: List<GameMetadataSource.DiscContent>,
+    ) {
+        val scratch = File(appContext.cacheDir, "disc-install")
+        var installed = 0
+        for ((index, item) in items.withIndex()) {
+            _state.value = ContentInstallState.Busy(
+                "Installing ${index + 1} of ${items.size}…", 0f)
+            val poll = viewModelScope.launch {
+                while (isActive) {
+                    val p = EmulatorRuntime.emulator?.installProgress() ?: 0f
+                    (_state.value as? ContentInstallState.Busy)
+                        ?.let { _state.value = it.copy(progress = p.coerceIn(0f, 1f)) }
+                    delay(200)
+                }
+            }
+            val status = withContext(Dispatchers.IO) {
+                val emu = EmulatorRuntime.emulator ?: return@withContext -1
+                emu.install_disc_content(
+                    discPath, item.innerPath,
+                    ContentPaths.contentRoot().absolutePath, scratch.absolutePath)
+            }
+            poll.cancel()
+            if (status != 0) {
+                _state.value = ContentInstallState.Failed(
+                    "Installed $installed of ${items.size}. " + installReasonFor(status))
+                return
+            }
+            installed++
+        }
+        runCatching { scratch.deleteRecursively() }
+        _state.value = ContentInstallState.Done(
+            "Installed $installed package(s) from the disc. Boot the play disc to use them.")
     }
 
     private suspend fun gamesDirOrNull(): File? =

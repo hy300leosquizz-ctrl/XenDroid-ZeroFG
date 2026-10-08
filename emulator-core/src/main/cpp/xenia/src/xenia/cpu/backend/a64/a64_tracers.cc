@@ -9,13 +9,21 @@
 
 #include "xenia/cpu/backend/a64/a64_tracers.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
+#include "xenia/base/byte_order.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/vec128.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/cpu/thread_state.h"
+#include "xenia/memory.h"
 
 namespace xe {
 namespace cpu {
@@ -119,6 +127,190 @@ void TraceFunctionReturn(void* raw_context, uint64_t function_address) {
   // Guest function return value (PPC r3).
   FPRINT("ret  {:08X} = {:X}\n", static_cast<uint32_t>(function_address),
          ppc_context->r[3]);
+}
+
+namespace {
+
+struct GuestCallLogSlot {
+  std::atomic<uint32_t> address{0};
+  std::atomic<uint32_t> hits{0};
+  std::atomic<uint64_t> last_value{~uint64_t(0)};
+};
+
+constexpr size_t kGuestCallLogSlotCount = 8;
+GuestCallLogSlot guest_call_entry_slots[kGuestCallLogSlotCount];
+GuestCallLogSlot guest_call_return_slots[kGuestCallLogSlotCount];
+
+// One "rN+off[>off2][:count]" term.
+struct GuestCallField {
+  std::string label;
+  uint32_t reg;
+  uint32_t offset;
+  bool indirect;
+  uint32_t indirect_offset;
+  uint32_t words;
+};
+
+constexpr uint32_t kMaxGuestCallFieldWords = 8;
+
+const std::vector<GuestCallField>& GetGuestCallFields() {
+  static const std::vector<GuestCallField> fields = []() {
+    std::vector<GuestCallField> parsed;
+    const std::string& list = cvars::log_guest_call_fields;
+    for (size_t pos = 0; pos < list.size();) {
+      size_t end = list.find(',', pos);
+      if (end == std::string::npos) {
+        end = list.size();
+      }
+      const std::string entry = list.substr(pos, end - pos);
+      pos = end + 1;
+      const char* cursor = entry.c_str();
+      while (*cursor == ' ' || *cursor == '\t') {
+        ++cursor;
+      }
+      const char* start = cursor;
+      if (*cursor == 'r' || *cursor == 'R') {
+        ++cursor;
+      }
+      char* parse_end = nullptr;
+      GuestCallField field = {};
+      field.reg = uint32_t(std::strtoul(cursor, &parse_end, 10));
+      if (parse_end == cursor || field.reg >= 32 || *parse_end != '+') {
+        continue;
+      }
+      cursor = parse_end + 1;
+      field.offset = uint32_t(std::strtoul(cursor, &parse_end, 16));
+      if (parse_end == cursor) {
+        continue;
+      }
+      cursor = parse_end;
+      if (*cursor == '>') {
+        field.indirect = true;
+        field.indirect_offset = uint32_t(std::strtoul(cursor + 1, &parse_end,
+                                                      16));
+        cursor = parse_end;
+      }
+      field.words = 1;
+      if (*cursor == ':') {
+        field.words = uint32_t(std::strtoul(cursor + 1, &parse_end, 10));
+        cursor = parse_end;
+        field.words = std::min(std::max(field.words, 1u),
+                               kMaxGuestCallFieldWords);
+      }
+      field.label.assign(start, cursor);
+      parsed.push_back(std::move(field));
+    }
+    return parsed;
+  }();
+  return fields;
+}
+
+bool ReadGuestWord(ppc::PPCContext* ppc_context, uint32_t address,
+                   uint32_t* out_value) {
+  auto* memory = ppc_context->processor ? ppc_context->processor->memory()
+                                        : nullptr;
+  if (!memory) {
+    return false;
+  }
+  auto* heap = memory->LookupHeap(address);
+  uint32_t protect = 0;
+  if (!heap || !heap->QueryProtect(address, &protect) ||
+      !(protect & kMemoryProtectRead)) {
+    return false;
+  }
+  *out_value =
+      xe::load_and_swap<uint32_t>(ppc_context->virtual_membase + address);
+  return true;
+}
+
+std::string FormatGuestCallFields(ppc::PPCContext* ppc_context) {
+  std::string formatted;
+  for (const auto& field : GetGuestCallFields()) {
+    uint32_t address =
+        static_cast<uint32_t>(ppc_context->r[field.reg]) + field.offset;
+    if (field.indirect) {
+      uint32_t pointer = 0;
+      if (!ReadGuestWord(ppc_context, address, &pointer)) {
+        formatted += fmt::format(" [{}]@{:08X}=<unmapped>", field.label,
+                                 address);
+        continue;
+      }
+      address = pointer + field.indirect_offset;
+    }
+    formatted += fmt::format(" [{}]@{:08X}=", field.label, address);
+    for (uint32_t word = 0; word < field.words; ++word) {
+      uint32_t value = 0;
+      if (ReadGuestWord(ppc_context, address + word * 4, &value)) {
+        formatted += fmt::format("{}{:08X}", word ? "," : "", value);
+      } else {
+        formatted += fmt::format("{}<unmapped>", word ? "," : "");
+        break;
+      }
+    }
+  }
+  return formatted;
+}
+
+GuestCallLogSlot* AcquireGuestCallLogSlot(GuestCallLogSlot* slots,
+                                          uint32_t address) {
+  for (size_t i = 0; i < kGuestCallLogSlotCount; ++i) {
+    uint32_t owner = slots[i].address.load(std::memory_order_acquire);
+    if (owner == address) {
+      return &slots[i];
+    }
+    if (!owner) {
+      uint32_t expected = 0;
+      if (slots[i].address.compare_exchange_strong(expected, address,
+                                                   std::memory_order_acq_rel) ||
+          expected == address) {
+        return &slots[i];
+      }
+    }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+void LogGuestCallEntry(void* raw_context, uint64_t function_address) {
+  auto ppc_context = reinterpret_cast<ppc::PPCContext*>(raw_context);
+  const uint32_t address = static_cast<uint32_t>(function_address);
+  auto* slot = AcquireGuestCallLogSlot(guest_call_entry_slots, address);
+  const uint32_t hits =
+      slot ? slot->hits.fetch_add(1, std::memory_order_relaxed) + 1 : 1;
+  if (cvars::log_guest_calls_limit && hits > cvars::log_guest_calls_limit) {
+    return;
+  }
+  XELOGI(
+      "guest call {:08X} #{} thread {:04X} lr={:08X} r3={:08X} r4={:08X} "
+      "r5={:08X} r11={:08X}{}",
+      address, hits, ppc_context->thread_id,
+      static_cast<uint32_t>(ppc_context->lr),
+      static_cast<uint32_t>(ppc_context->r[3]),
+      static_cast<uint32_t>(ppc_context->r[4]),
+      static_cast<uint32_t>(ppc_context->r[5]),
+      static_cast<uint32_t>(ppc_context->r[11]),
+      FormatGuestCallFields(ppc_context));
+}
+
+void LogGuestCallReturn(void* raw_context, uint64_t function_address) {
+  auto ppc_context = reinterpret_cast<ppc::PPCContext*>(raw_context);
+  const uint32_t address = static_cast<uint32_t>(function_address);
+  const uint64_t value = ppc_context->r[3];
+  auto* slot = AcquireGuestCallLogSlot(guest_call_return_slots, address);
+  const uint32_t hits =
+      slot ? slot->hits.fetch_add(1, std::memory_order_relaxed) + 1 : 1;
+  // A changed return value is the interesting event for a readiness gate, so
+  // it outlives the line budget.
+  const bool changed =
+      slot &&
+      slot->last_value.exchange(value, std::memory_order_relaxed) != value;
+  if (!changed && cvars::log_guest_calls_limit &&
+      hits > cvars::log_guest_calls_limit) {
+    return;
+  }
+  XELOGI("guest ret {:08X} #{} thread {:04X} r3={:08X}", address, hits,
+         ppc_context->thread_id, static_cast<uint32_t>(value));
 }
 
 void TraceString(void* raw_context, const char* str) {

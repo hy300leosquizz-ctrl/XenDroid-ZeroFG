@@ -168,6 +168,9 @@ class GuestScheduler {
   // At least this often every blocked fiber re-polls regardless of the epoch
   // gate, so a missed epoch bump costs a latency blip, not a hang.
   static constexpr uint64_t kRepollBackstopMs = 64;
+  // Backstop rescues per 5s window before the missed-wake tripwire warns.
+  // Above the benign signal/park race rate, far below a real regression.
+  static constexpr uint64_t kBackstopRescueWarnThreshold = 50;
   // Floor on the watchdog's wake period. Below this the wakeups cost more than
   // the preemption accuracy is worth on a mobile SoC.
   static constexpr uint64_t kMinWatchdogPeriodUs = 250;
@@ -239,7 +242,9 @@ class GuestScheduler {
   // |except| is the only ready thread. Used to honor a voluntary yield.
   static XThread* HighestReadyExcept(const Cpu& cpu, XThread* except);
   void SwitchTo(XThread* next);
-  void RereadyBlocked(int cpu_index);
+  // |poked| distinguishes a wake-driven pass from a timed one, so the
+  // missed-wake tripwire only counts rescues the backstop alone made.
+  void RereadyBlocked(int cpu_index, bool poked = false);
   // Parks a thread whose suspend count is nonzero until Resume drops it.
   // Returns false if the count already reached zero, meaning run it instead.
   bool ParkSuspended(XThread* thread, int cpu_index);
@@ -332,6 +337,7 @@ class GuestScheduler {
   struct Stats {
     std::atomic<uint64_t> repolls{0};        // RereadyBlocked passes
     std::atomic<uint64_t> rereadied{0};      // waiters actually re-readied
+    std::atomic<uint64_t> backstop_rescues{0};  // wakes the backstop covered
     std::atomic<uint64_t> idle_wakes{0};     // timed wakes of a parked CPU
     std::atomic<uint64_t> switches{0};       // fiber dispatches
     std::atomic<uint64_t> forced_preempts{0};  // IRQL defers escaped
@@ -342,6 +348,11 @@ class GuestScheduler {
   };
   Stats stats_;
   uint64_t stats_last_report_ms_ = 0;
+  // Missed-wake tripwire window, guarded by lock_.
+  uint64_t backstop_rescue_window_ms_ = 0;
+  uint64_t backstop_rescue_count_ = 0;
+  uint32_t backstop_rescue_tid_ = 0;
+  uint32_t backstop_rescue_handle_ = 0;
   // Calibrated in EnsureStarted, used to render the raw-tick I/O counters.
   double ticks_per_us_ = 0.0;
   void ReportStatsIfDue();

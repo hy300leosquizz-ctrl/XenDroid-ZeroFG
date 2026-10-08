@@ -27,6 +27,10 @@ DEFINE_uint32(
     "Depth of the Android audio buffer, in device bursts. Higher rides out "
     "emulator slowdowns without dropping audio, at the cost of latency.",
     "APU");
+DEFINE_bool(apu_aaudio_dynamic_rate, true,
+            "Slow playback toward 0.9x as the audio queue drains, so a guest "
+            "that cannot keep real time bends pitch instead of popping.",
+            "APU");
 DEFINE_bool(apu_aaudio_log_stats, false,
             "Log Android audio callback statistics (gaps, queue depth, "
             "underruns) once a second.",
@@ -37,6 +41,9 @@ namespace apu {
 namespace aaudio {
 
 static constexpr uint32_t kStatsIntervalMs = 1000;
+
+// Sink depth, in blocks, below which playback slows to buy the producer time.
+static constexpr uint32_t kRateControlDepth = 3;
 
 AAudioAudioDriver::AAudioAudioDriver(Memory* memory,
                                      xe::threading::Semaphore* semaphore,
@@ -167,9 +174,20 @@ void AAudioAudioDriver::Pause() {
 
 void AAudioAudioDriver::Resume() {
   std::unique_lock<std::mutex> stream_guard(stream_mutex_);
+  // Resuming at the rate the drained queue asked for would play slow; block
+  // position and resampler history carry over, so playback stays continuous.
+  rate_ = 1.0f;
+  conceal_gain_ = 1.0f;
+  gap_blocks_ = 0;
+  stat_rate_milli_.store(1000, std::memory_order_relaxed);
   if (stream_initialized_ && stream_) {
     AAudioStream_requestStart(stream_);
   }
+}
+
+size_t AAudioAudioDriver::GetQueuedFrameCount() {
+  std::unique_lock<std::mutex> guard(frames_mutex_);
+  return frames_queued_.size();
 }
 
 void AAudioAudioDriver::SetVolume(float volume) {
@@ -192,78 +210,55 @@ aaudio_data_callback_result_t AAudioAudioDriver::AudioCallback(
   // shared-mode fallback and on every rebuild. The conversion below uses
   // channel_samples_ as its source stride, so it must run at that size
   // whatever this callback was handed.
-  const int32_t out_samples = numFrames * host_frame_channels_;
   if (numFrames != static_cast<int32_t>(driver->channel_samples_)) {
     driver->stat_unexpected_frames_.store(numFrames, std::memory_order_relaxed);
   }
 
   driver->stat_callbacks_.fetch_add(1, std::memory_order_relaxed);
 
-  // Fill the whole request, however many guest blocks that takes: a callback
-  // size other than channel_samples_ would otherwise pad with silence or
-  // discard the rest of a block.
+  // Queue depth steers the resample rate, slewed to avoid zipper noise: a
+  // producer below real time bends pitch instead of gapping.
+  uint32_t depth_now;
+  {
+    std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+    depth_now = static_cast<uint32_t>(driver->frames_queued_.size());
+  }
+  // Only once the sink is close to running dry, and always below the depth the
+  // producer refills to (AudioSystem's top-up line) - bending pitch at a depth
+  // the producer is content with leaves the rate permanently modulated.
+  float rate_target = 1.0f;
+  if (cvars::apu_aaudio_dynamic_rate && depth_now < kRateControlDepth) {
+    rate_target =
+        std::max(0.90f, 1.0f - 0.05f * float(kRateControlDepth - depth_now));
+  }
+  driver->rate_ +=
+      std::clamp(rate_target - driver->rate_, -0.003f, 0.003f);
+  driver->stat_rate_milli_.store(
+      static_cast<uint32_t>(driver->rate_ * 1000.0f + 0.5f),
+      std::memory_order_relaxed);
+
   int32_t frames_done = 0;
   uint32_t releases = 0;
   bool gapped = false;
   while (frames_done < numFrames) {
-    if (driver->last_block_pos_ >= driver->channel_samples_) {
-      float* buffer = nullptr;
-      uint32_t depth = 0;
-      {
-        // Held only across the queue pop.
-        std::unique_lock<std::mutex> guard(driver->frames_mutex_);
-        depth = static_cast<uint32_t>(driver->frames_queued_.size());
-        if (!driver->frames_queued_.empty()) {
-          buffer = driver->frames_queued_.front();
-          driver->frames_queued_.pop();
-        }
+    while (driver->resample_frac_ >= 1.0f) {
+      driver->resample_frac_ -= 1.0f;
+      if (driver->last_block_pos_ >= driver->channel_samples_) {
+        driver->LoadNextBlock(releases, gapped);
       }
-      driver->stat_queue_depth_sum_.fetch_add(depth, std::memory_order_relaxed);
-      if (depth > driver->stat_queue_depth_max_.load(std::memory_order_relaxed)) {
-        driver->stat_queue_depth_max_.store(depth, std::memory_order_relaxed);
-      }
-      if (!buffer) {
-        // Conceal only the part still owed.
-        driver->stat_gaps_.fetch_add(1, std::memory_order_relaxed);
-        gapped = true;
-        // ConcealGap repeats last_block_, so it can source at most one block.
-        const int32_t done_samples = frames_done * host_frame_channels_;
-        const int32_t owed_samples = out_samples - done_samples;
-        driver->ConcealGap(
-            output_buffer + done_samples, owed_samples,
-            std::min(owed_samples, static_cast<int32_t>(driver->host_block_samples_)));
-        break;
-      }
-      if (driver->frame_channels_ == 6) {
-        conversion::sequential_6_BE_to_interleaved_2_LE(
-            driver->last_block_.data(), buffer, driver->channel_samples_);
-      } else {
-        // Media player: already interleaved host endian stereo.
-        std::memcpy(driver->last_block_.data(), buffer,
-                    driver->host_block_samples_ * sizeof(float));
-      }
-      driver->ApplyGainAndClamp();
-      driver->ApplyFadeIn();
-      driver->last_block_valid_ = true;
-      driver->last_block_pos_ = 0;
-      driver->gap_blocks_ = 0;
-      {
-        std::unique_lock<std::mutex> guard(driver->frames_mutex_);
-        driver->frames_unused_.push(buffer);
-      }
-      ++releases;
+      driver->prev_l_ = driver->cur_l_;
+      driver->prev_r_ = driver->cur_r_;
+      driver->cur_l_ = driver->last_block_[driver->last_block_pos_ * 2 + 0];
+      driver->cur_r_ = driver->last_block_[driver->last_block_pos_ * 2 + 1];
+      driver->last_block_pos_++;
     }
-    const int32_t chunk = std::min<int32_t>(
-        numFrames - frames_done,
-        static_cast<int32_t>(driver->channel_samples_ -
-                             driver->last_block_pos_));
-    std::memcpy(
-        output_buffer + frames_done * host_frame_channels_,
-        driver->last_block_.data() +
-            driver->last_block_pos_ * host_frame_channels_,
-        chunk * host_frame_channels_ * sizeof(float));
-    driver->last_block_pos_ += static_cast<uint32_t>(chunk);
-    frames_done += chunk;
+    const float f = driver->resample_frac_;
+    output_buffer[frames_done * 2 + 0] =
+        driver->prev_l_ + f * (driver->cur_l_ - driver->prev_l_);
+    output_buffer[frames_done * 2 + 1] =
+        driver->prev_r_ + f * (driver->cur_r_ - driver->prev_r_);
+    frames_done++;
+    driver->resample_frac_ += driver->rate_;
   }
 
   // One tick per block consumed, so pacing holds when the callback size is
@@ -278,36 +273,72 @@ aaudio_data_callback_result_t AAudioAudioDriver::AudioCallback(
   return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-void AAudioAudioDriver::ConcealGap(float* output, int32_t out_samples,
-                                   int32_t copy_samples) {
+void AAudioAudioDriver::LoadNextBlock(uint32_t& releases, bool& gapped) {
+  float* buffer = nullptr;
+  uint32_t depth = 0;
+  {
+    std::unique_lock<std::mutex> guard(frames_mutex_);
+    depth = static_cast<uint32_t>(frames_queued_.size());
+    if (!frames_queued_.empty()) {
+      buffer = frames_queued_.front();
+      frames_queued_.pop();
+    }
+  }
+  stat_queue_depth_sum_.fetch_add(depth, std::memory_order_relaxed);
+  if (depth > stat_queue_depth_max_.load(std::memory_order_relaxed)) {
+    stat_queue_depth_max_.store(depth, std::memory_order_relaxed);
+  }
+  if (!buffer) {
+    stat_gaps_.fetch_add(1, std::memory_order_relaxed);
+    gapped = true;
+    ConcealNextBlock();
+    last_block_pos_ = 0;
+    return;
+  }
+  if (frame_channels_ == 6) {
+    conversion::sequential_6_BE_to_interleaved_2_LE(last_block_.data(), buffer,
+                                                    channel_samples_);
+  } else {
+    // Media player: already interleaved host endian stereo.
+    std::memcpy(last_block_.data(), buffer,
+                host_block_samples_ * sizeof(float));
+  }
+  ApplyGainAndClamp();
+  ApplyFadeIn();
+  last_block_valid_ = true;
+  last_block_pos_ = 0;
+  gap_blocks_ = 0;
+  conceal_gain_ = 1.0f;
+  {
+    std::unique_lock<std::mutex> guard(frames_mutex_);
+    frames_unused_.push(buffer);
+  }
+  ++releases;
+}
+
+void AAudioAudioDriver::ConcealNextBlock() {
   // Nothing to repeat yet: startup, or straight after a mute.
   if (!last_block_valid_) {
-    std::memset(output, 0, out_samples * sizeof(float));
+    std::memset(last_block_.data(), 0, host_block_samples_ * sizeof(float));
     return;
   }
 
-  // Repeat the last block, decaying it: held flat it would buzz at the block
-  // rate, decayed it fades out instead of slamming to silence.
-  const float start_gain = std::pow(0.6f, static_cast<float>(gap_blocks_));
-  if (start_gain < 0.002f) {
-    std::memset(output, 0, out_samples * sizeof(float));
+  // Repeat the last block, decaying it in place: held flat it would buzz at
+  // the block rate, decayed it fades out instead of slamming to silence.
+  conceal_gain_ *= 0.6f;
+  if (conceal_gain_ < 0.002f) {
+    std::memset(last_block_.data(), 0, host_block_samples_ * sizeof(float));
     last_block_valid_ = false;
     gap_blocks_++;
     fade_in_pending_ = true;
     return;
   }
-  const float end_gain = start_gain * 0.6f;
-  const int32_t frames = copy_samples / host_frame_channels_;
-  const float step = frames > 0 ? (end_gain - start_gain) / frames : 0.0f;
-
+  const int32_t frames = static_cast<int32_t>(channel_samples_);
+  const float step = frames > 0 ? (0.6f - 1.0f) / frames : 0.0f;
   for (int32_t f = 0; f < frames; ++f) {
-    const float g = start_gain + step * f;
-    output[f * 2 + 0] = last_block_[f * 2 + 0] * g;
-    output[f * 2 + 1] = last_block_[f * 2 + 1] * g;
-  }
-  if (out_samples > copy_samples) {
-    std::memset(output + copy_samples, 0,
-                (out_samples - copy_samples) * sizeof(float));
+    const float g = 1.0f + step * f;
+    last_block_[f * 2 + 0] *= g;
+    last_block_[f * 2 + 1] *= g;
   }
   gap_blocks_++;
   fade_in_pending_ = true;
@@ -378,10 +409,12 @@ void AAudioAudioDriver::LogAndResetStats() {
   }
 
   XELOGI(
-      "AAudio: {} cb, {} gaps ({:.1f}%), queue avg {:.2f} max {}, xruns {}, "
-      "clipped {} ({:.3f}%){}",
+      "AAudio: {} cb, {} gaps ({:.1f}%), queue avg {:.2f} max {}, rate {:.3f}, "
+      "xruns {}, clipped {} ({:.3f}%){}",
       callbacks, gaps, 100.0 * double(gaps) / double(callbacks),
-      double(depth_sum) / double(callbacks), depth_max, xruns, clipped,
+      double(depth_sum) / double(callbacks), depth_max,
+      stat_rate_milli_.load(std::memory_order_relaxed) / 1000.0, xruns,
+      clipped,
       played ? 100.0 * double(clipped) / double(played) : 0.0,
       odd_frames ? fmt::format(", UNEXPECTED framesPerCallback {}", odd_frames)
                  : "");

@@ -963,7 +963,7 @@ void GuestScheduler::WakeAll() {
   // most one backoff interval.
   bool any_blocked = false;
   for (int i = 0; i < kMaxCpus; ++i) {
-    if (cpus_[i].has_blocked.load(std::memory_order_relaxed)) {
+    if (cpus_[i].has_blocked.load()) {
       any_blocked = true;
       break;
     }
@@ -1005,7 +1005,7 @@ void GuestScheduler::WakeForSignal(const XObject* object,
   }
   bool any_blocked = false;
   for (int i = 0; i < kMaxCpus; ++i) {
-    if (cpus_[i].has_blocked.load(std::memory_order_relaxed)) {
+    if (cpus_[i].has_blocked.load()) {
       any_blocked = true;
       break;
     }
@@ -1137,6 +1137,25 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
   }
   {
     std::lock_guard<std::mutex> lock(lock_);
+    // A signal between the caller's failed poll and this park bumped the epoch
+    // but walked the blocked list before we joined it, so nothing would re-poll
+    // us before the backstop. Compare under the walk's own lock and poke this
+    // CPU on a mismatch; returning to re-poll instead livelocks when the epoch
+    // churns faster than a park roundtrip.
+    if (gated) {
+      uint32_t epoch_now = 0;
+      bool epoch_gated = false;
+      if (wait_object) {
+        epoch_now = wait_object->cooperative_signal_epoch();
+        epoch_gated = true;
+      } else if (self->cooperative_wait_set_count()) {
+        epoch_now = self->cooperative_wait_set_epoch();
+        epoch_gated = true;
+      }
+      if (epoch_gated && epoch_now != wait_epoch) {
+        cpus_[cpu_index].repoll_now.store(true, std::memory_order_relaxed);
+      }
+    }
     auto& links = self->scheduler_links();
     // Park self (running, in no list) on this CPU's blocked list.
     links.blocked = true;
@@ -1167,7 +1186,9 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
     if (due && due < cpu.next_timed_repoll_ms) {
       cpu.next_timed_repoll_ms = due;
     }
-    cpu.has_blocked.store(true, std::memory_order_relaxed);
+    // seq_cst pairs with the wake pre-filters' loads: epoch-read-then-store
+    // here vs bump-then-load there, so at least one side always sees the other.
+    cpu.has_blocked.store(true);
   }
   self->guest_object<X_KTHREAD>()->thread_state = KTHREAD_STATE_WAITING;
   YieldToScheduler();
@@ -1177,9 +1198,15 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
   }
 }
 
-void GuestScheduler::RereadyBlocked(int cpu_index) {
+void GuestScheduler::RereadyBlocked(int cpu_index, bool poked) {
   uint32_t wake_mask = 0;
   stats_.repolls.fetch_add(1, std::memory_order_relaxed);
+  // Missed-wake tripwire, logged after the lock is released.
+  uint64_t rescued = 0;
+  bool warn = false;
+  uint64_t warn_count = 0;
+  uint32_t warn_tid = 0;
+  uint32_t warn_handle = 0;
   {
     std::lock_guard<std::mutex> lock(lock_);
     Cpu& cpu = cpus_[cpu_index];
@@ -1232,6 +1259,25 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
           continue;
         }
       }
+      // Only the backstop reached this waiter, on a pass no wake poked, yet
+      // its gate's epoch moved: the signal's own wake never re-readied it.
+      if (force_all && !poked && links.wait_gated) {
+        XObject* obj = t->cooperative_wait_object();
+        bool epoch_moved = false;
+        if (obj) {
+          epoch_moved = obj->cooperative_signal_epoch() != links.wait_epoch;
+        } else if (links.wait_gate_count) {
+          epoch_moved =
+              t->cooperative_wait_set_epoch() != links.wait_epoch;
+        }
+        if (epoch_moved &&
+            !(links.wait_deadline_ms && now_ms >= links.wait_deadline_ms)) {
+          ++rescued;
+          backstop_rescue_tid_ = t->thread_id();
+          backstop_rescue_handle_ =
+              links.wait_handle_count ? links.wait_handles[0] : 0;
+        }
+      }
       links.blocked = false;
       links.queued = true;
       stats_.rereadied.fetch_add(1, std::memory_order_relaxed);
@@ -1252,6 +1298,30 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
     cpu.max_blocked_prio = kept_max_prio;
     cpu.next_timed_repoll_ms = next_due;
     cpu.has_blocked.store(kept_head != nullptr, std::memory_order_relaxed);
+    if (rescued) {
+      stats_.backstop_rescues.fetch_add(rescued, std::memory_order_relaxed);
+      backstop_rescue_count_ += rescued;
+    }
+    if (!backstop_rescue_window_ms_) {
+      backstop_rescue_window_ms_ = now_ms;
+    }
+    if (now_ms - backstop_rescue_window_ms_ >= 5000) {
+      if (backstop_rescue_count_ >= kBackstopRescueWarnThreshold) {
+        warn = true;
+        warn_count = backstop_rescue_count_;
+        warn_tid = backstop_rescue_tid_;
+        warn_handle = backstop_rescue_handle_;
+      }
+      backstop_rescue_window_ms_ = now_ms;
+      backstop_rescue_count_ = 0;
+    }
+  }
+  if (warn) {
+    XELOGW(
+        "GuestScheduler: {} gated waits were only re-readied by the {}ms "
+        "backstop in the last 5s despite a signal having arrived - wakes are "
+        "being lost (last: tid={:08X} handle={:08X})",
+        warn_count, kRepollBackstopMs, warn_tid, warn_handle);
   }
   // Wake any other dispatch thread that received a ready fiber (this one runs).
   for (int i = 0; i < kMaxCpus; ++i) {
@@ -1277,9 +1347,9 @@ void GuestScheduler::RunLoop(int cpu_index) {
     // busy fiber that rarely waits would starve them. The timer runs at what
     // the parked waiters actually need, a wake skips it entirely.
     uint64_t now = Clock::QueryHostUptimeMillis();
-    if (cpu.repoll_now.exchange(false, std::memory_order_relaxed) ||
-        now >= cpu.next_timed_repoll_ms) {
-      RereadyBlocked(cpu_index);
+    bool poked = cpu.repoll_now.exchange(false, std::memory_order_relaxed);
+    if (poked || now >= cpu.next_timed_repoll_ms) {
+      RereadyBlocked(cpu_index, poked);
     }
 
     XThread* next = DequeueReady(cpu_index);
@@ -1388,6 +1458,7 @@ void GuestScheduler::ReportStatsIfDue() {
   };
   uint64_t repolls = take(stats_.repolls);
   uint64_t rereadied = take(stats_.rereadied);
+  uint64_t backstop_rescues = take(stats_.backstop_rescues);
   uint64_t idle_wakes = take(stats_.idle_wakes);
   uint64_t switches = take(stats_.switches);
   uint64_t forced = take(stats_.forced_preempts);
@@ -1400,10 +1471,12 @@ void GuestScheduler::ReportStatsIfDue() {
     return uint64_t(double(ticks) / ticks_per_us);
   };
   XELOGI(
-      "GuestScheduler: repolls {}/s (rereadied {}), idle wakes {}, switches "
+      "GuestScheduler: repolls {}/s (rereadied {}, backstop rescues {}), idle "
+      "wakes {}, switches "
       "{}, forced preempts {} | io {} calls, queued avg {} us max {} us, ran "
       "avg {} us",
-      repolls, rereadied, idle_wakes, switches, forced, io_calls,
+      repolls, rereadied, backstop_rescues, idle_wakes, switches, forced,
+      io_calls,
       io_calls ? to_us(io_queue / io_calls) : 0, to_us(io_queue_max),
       io_calls ? to_us(io_run / io_calls) : 0);
 }

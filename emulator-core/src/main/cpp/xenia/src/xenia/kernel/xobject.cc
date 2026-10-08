@@ -395,9 +395,10 @@ void XObject::WakeCooperativeWaiters() {
   // Wake only the CPUs that can act on this signal instead of every CPU with
   // any blocked thread - broadcast wakes on every semaphore release were most
   // of some titles' kernel time (Eternal Sonata: 69% of CPU in futex wakes
-  // and the resulting empty scheduling passes).
-  kernel_state()->guest_scheduler()->WakeForSignal(this,
-                                                   CooperativeWakeTarget());
+  // and the resulting empty scheduling passes). Every watcher's CPU is woken,
+  // not just the permit FIFO front's, which loses the wake whenever that
+  // waiter leaves between the signal and its dispatch.
+  kernel_state()->guest_scheduler()->WakeForSignal(this, nullptr);
 }
 
 void XObject::EnterCooperativeWait(XThread* thread) {

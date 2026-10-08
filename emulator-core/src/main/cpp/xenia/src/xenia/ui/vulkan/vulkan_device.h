@@ -13,19 +13,67 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <utility>
 #include <vector>
 
 #include "xenia/ui/vulkan/vulkan_instance.h"
+// This header is also consumed by GPU targets that do not link ZeroFG. Keep
+// the data-only capability type reachable without adding a core dependency.
+#include "../../../../../zerofg/include/zerofg/backend_capabilities.h"
 
 namespace xe {
 namespace ui {
 namespace vulkan {
 
+struct ZeroFGBackendFeatureRequests {
+  bool filter_cubic = false;
+  bool qcom_image_processing = false;
+  bool qcom_block_match = false;
+  bool float16 = false;
+};
+
 class VulkanDevice {
  public:
+  // kZeroFGMainSurfacePresenter is device B: ZeroFG's own device, with WSI,
+  // the SurfaceView's single producer under Main Surface Authority.
+  enum class CreationProfile {
+    kXenDroid,
+    kZeroFGMainSurfacePresenter,
+  };
   static std::unique_ptr<VulkanDevice> CreateIfSupported(
       const VulkanInstance* vulkan_instance, VkPhysicalDevice physical_device,
-      bool with_gpu_emulation, bool with_swapchain);
+      bool with_gpu_emulation, bool with_swapchain,
+      CreationProfile profile = CreationProfile::kXenDroid,
+      ZeroFGBackendFeatureRequests backend_requests = {});
+
+  const zerofg::Capabilities& zerofg_backend_capabilities() const {
+    return zerofg_backend_capabilities_;
+  }
+  // Resource creation only: query the actual image usage/flags/view, not an
+  // extension string. The default known formats are sampled optimal 2D views.
+  zerofg::Capabilities::Format QueryZeroFGBackendFormat(
+      VkFormat format, VkImageUsageFlags usage,
+      VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL,
+      VkImageCreateFlags create_flags = 0,
+      VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D) const;
+
+  bool is_zerofg_presenter_device() const {
+    return creation_profile_ == CreationProfile::kZeroFGMainSurfacePresenter;
+  }
+  // Host lifecycle only. Never invoked by Source or a live submission path.
+  bool DrainZeroFGForTeardown();
+  bool zerofg_teardown_idle() const {
+    return zerofg_teardown_idle_.load(std::memory_order_acquire);
+  }
+  void BeginZeroFGSurface() {
+    zerofg_teardown_idle_.store(false, std::memory_order_release);
+    teardown_submit_rejected_.store(false, std::memory_order_release);
+  }
+  // Returns true when a ZeroFG submission must be rejected because teardown
+  // has already established device-B idle. This is intentionally a narrow
+  // presenter-device guard; it adds no wait to the live path.
+  bool RejectZeroFGSubmitAfterTeardownIdle();
 
   VulkanDevice(const VulkanDevice&) = delete;
   VulkanDevice& operator=(const VulkanDevice&) = delete;
@@ -121,6 +169,7 @@ class VulkanDevice {
     bool shaderClipDistance = false;
     bool shaderCullDistance = false;
     bool shaderInt16 = false;
+    bool shaderStorageImageExtendedFormats = false;
     bool sparseBinding = false;
     bool sparseResidencyBuffer = false;
 
@@ -139,6 +188,7 @@ class VulkanDevice {
     // VK_EXT_host_query_reset (promoted to 1.2)
 
     bool hostQueryReset = false;
+    bool timelineSemaphore = false;
 
     // VK_KHR_shader_float16_int8 (#83, promoted to 1.2)
 
@@ -176,6 +226,7 @@ class VulkanDevice {
     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
 
     bool dynamicRendering = false;
+    bool synchronization2 = false;
 
     // VK_KHR_dynamic_rendering_local_read (#233, promoted to 1.4)
 
@@ -202,8 +253,10 @@ class VulkanDevice {
     // VK_EXT_subgroup_size_control (#226, promoted to 1.3)
     uint32_t minSubgroupSize = 0;
     uint32_t maxSubgroupSize = 0;
+    uint32_t maxComputeWorkgroupSubgroups = 0;
     bool subgroupSizeControl = false;
     bool computeFullSubgroups = false;
+    bool maintenance4 = false;
 
     // VK_EXT_extended_dynamic_state (#268) / VK_EXT_extended_dynamic_state2
     // (#378). Both promoted to Vulkan 1.3 core. On the target (Vulkan 1.3),
@@ -230,6 +283,12 @@ class VulkanDevice {
     // VK_EXT_external_memory_host (#179). Alignment a host pointer must satisfy
     // to be imported. 0 if the extension is not enabled.
     VkDeviceSize minImportedHostPointerAlignment = 0;
+
+    // Optional RC1 Test diagnostics on device B. Advertisement, supported
+    // feature and enabled feature are separate facts; none is an RC1 gate.
+    bool pipelineExecutablePropertiesAdvertised = false;
+    bool pipelineExecutableInfoSupported = false;
+    bool pipelineExecutableInfo = false;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.
@@ -243,6 +302,7 @@ class VulkanDevice {
   // the Vulkan API they were promoted to it supported (with the
   // `ext_major_minor_` prefix rather than `ext_`).
   struct Extensions {
+    bool ext_KHR_pipeline_executable_properties = false;
     bool ext_KHR_swapchain = false;                     // #2
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
@@ -254,6 +314,7 @@ class VulkanDevice {
     bool ext_1_2_KHR_spirv_1_4 = false;                 // #237
     bool ext_EXT_memory_budget = false;                 // #238
     bool ext_1_2_EXT_host_query_reset = false;          // promoted to 1.2
+    bool ext_1_2_KHR_timeline_semaphore = false;        // promoted to 1.2
     // Has optional features not implied by this being true.
     bool ext_1_3_KHR_maintenance4 = false;  // #414
     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
@@ -280,6 +341,12 @@ class VulkanDevice {
     // VK_EXT_external_memory_host (#179). Imports guest RAM as device memory so
     // the shared-memory buffer can alias guest RAM directly (zero-copy).
     bool ext_EXT_external_memory_host = false;
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+    // ZeroFG independent Android presenter support. These are enabled only
+    // when a ZeroFG session requests them and remain optional capability gates.
+    bool ext_ANDROID_external_memory_android_hardware_buffer = false;
+    bool ext_KHR_external_semaphore_fd = false;
+#endif
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -289,6 +356,45 @@ class VulkanDevice {
       const {
     return vkGetMemoryHostPointerPropertiesEXT_;
   }
+  PFN_vkGetRefreshCycleDurationGOOGLE vkGetRefreshCycleDurationGOOGLE() const {
+    return vkGetRefreshCycleDurationGOOGLE_;
+  }
+  PFN_vkGetPastPresentationTimingGOOGLE vkGetPastPresentationTimingGOOGLE()
+      const {
+    return vkGetPastPresentationTimingGOOGLE_;
+  }
+  PFN_vkGetPipelineExecutablePropertiesKHR
+  vkGetPipelineExecutablePropertiesKHR() const {
+    return vkGetPipelineExecutablePropertiesKHR_;
+  }
+  PFN_vkGetPipelineExecutableStatisticsKHR
+  vkGetPipelineExecutableStatisticsKHR() const {
+    return vkGetPipelineExecutableStatisticsKHR_;
+  }
+  PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue() const {
+    return vkGetSemaphoreCounterValue_;
+  }
+  PFN_vkWaitSemaphores vkWaitSemaphores() const { return vkWaitSemaphores_; }
+  PFN_vkCmdPipelineBarrier2 vkCmdPipelineBarrier2() const {
+    return vkCmdPipelineBarrier2_;
+  }
+  PFN_vkDeviceWaitIdle vkDeviceWaitIdle() const { return vkDeviceWaitIdle_; }
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  PFN_vkGetSemaphoreFdKHR vkGetSemaphoreFdKHR() const {
+    return vkGetSemaphoreFdKHR_;
+  }
+  PFN_vkImportSemaphoreFdKHR vkImportSemaphoreFdKHR() const {
+    return vkImportSemaphoreFdKHR_;
+  }
+  PFN_vkGetAndroidHardwareBufferPropertiesANDROID
+  vkGetAndroidHardwareBufferPropertiesANDROID() const {
+    return vkGetAndroidHardwareBufferPropertiesANDROID_;
+  }
+  PFN_vkGetPhysicalDeviceImageFormatProperties2
+  vkGetPhysicalDeviceImageFormatProperties2() const {
+    return vkGetPhysicalDeviceImageFormatProperties2_;
+  }
+#endif
 
   VkDevice device() const { return device_; }
 
@@ -353,8 +459,11 @@ class VulkanDevice {
      public:
       explicit Acquisition(Queue& queue)
           : lock_(queue.mutex), queue_(queue.queue) {}
+      Acquisition(Queue& queue, std::defer_lock_t)
+          : lock_(queue.mutex, std::defer_lock), queue_(queue.queue) {}
 
       VkQueue queue() const { return queue_; }
+      bool TryLock() { return lock_.try_lock(); }
 
      private:
       std::unique_lock<std::recursive_mutex> lock_;
@@ -362,10 +471,19 @@ class VulkanDevice {
     };
 
     Acquisition Acquire() { return Acquisition(*this); }
+    std::optional<Acquisition> TryAcquire() {
+      Acquisition acquisition(*this, std::defer_lock);
+      if (!acquisition.TryLock()) {
+        return std::nullopt;
+      }
+      return std::optional<Acquisition>(std::move(acquisition));
+    }
   };
 
   struct QueueFamily {
     VkQueueFlags queue_flags = 0;
+    uint32_t timestamp_valid_bits = 0;
+    uint32_t physical_queue_count = 0;
     bool may_support_presentation = false;
     std::vector<std::unique_ptr<Queue>> queues;
   };
@@ -376,6 +494,23 @@ class VulkanDevice {
   uint32_t queue_family_graphics_compute() const {
     return queue_family_graphics_compute_;
   }
+  // ZeroFG runs on its own device B: Generation/Post/transfer stay on B:0,
+  // and B:1, when enabled, belongs to Main Surface egress.
+  uint32_t queue_index_zerofg_presenter() const { return 0u; }
+  // Main Surface egress (copy + present): B:1 when the main-surface profile
+  // enabled it, otherwise B:0.
+  uint32_t queue_index_zerofg_main_surface_present() const {
+    return is_zerofg_presenter_device() &&
+                   queue_families_[queue_family_graphics_compute_]
+                           .queues.size() > 1
+               ? 1u
+               : 0u;
+  }
+  // GPU busy share over the platform's last sampling period, in permille, for
+  // a mitigation that must confirm GPU saturation (the Main Surface GPU
+  // Apocalypse Guard). Adreno: KGSL's gpubusy counters, updated about once a
+  // second. Empty where the platform offers no such reading.
+  std::optional<uint32_t> QueryGpuBusyPermille() const;
   // UINT32_MAX if not supported or not enabled.
   // May be the same as queue_family_graphics_compute().
   uint32_t queue_family_sparse_binding() const {
@@ -389,6 +524,12 @@ class VulkanDevice {
   Queue::Acquisition AcquireQueue(const uint32_t queue_family_index,
                                   const uint32_t queue_index) const {
     return queue_families()[queue_family_index].queues[queue_index]->Acquire();
+  }
+  std::optional<Queue::Acquisition> TryAcquireQueue(
+      const uint32_t queue_family_index, const uint32_t queue_index) const {
+    return queue_families()[queue_family_index]
+        .queues[queue_index]
+        ->TryAcquire();
   }
 
   struct MemoryTypes {
@@ -434,9 +575,13 @@ class VulkanDevice {
 
   const VulkanInstance* vulkan_instance_ = nullptr;
   VkPhysicalDevice physical_device_ = nullptr;
+  CreationProfile creation_profile_ = CreationProfile::kXenDroid;
+  std::atomic<bool> zerofg_teardown_idle_{false};
+  std::atomic<bool> teardown_submit_rejected_{false};
 
   Properties properties_;
   Extensions extensions_;
+  zerofg::Capabilities zerofg_backend_capabilities_;
 
   VkDevice device_ = nullptr;
 
@@ -458,6 +603,26 @@ class VulkanDevice {
   // is enabled. Null otherwise.
   PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT_ =
       nullptr;
+  PFN_vkGetRefreshCycleDurationGOOGLE vkGetRefreshCycleDurationGOOGLE_ =
+      nullptr;
+  PFN_vkGetPastPresentationTimingGOOGLE vkGetPastPresentationTimingGOOGLE_ =
+      nullptr;
+  PFN_vkGetPipelineExecutablePropertiesKHR
+      vkGetPipelineExecutablePropertiesKHR_ = nullptr;
+  PFN_vkGetPipelineExecutableStatisticsKHR
+      vkGetPipelineExecutableStatisticsKHR_ = nullptr;
+  PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue_ = nullptr;
+  PFN_vkWaitSemaphores vkWaitSemaphores_ = nullptr;
+  PFN_vkCmdPipelineBarrier2 vkCmdPipelineBarrier2_ = nullptr;
+  PFN_vkDeviceWaitIdle vkDeviceWaitIdle_ = nullptr;
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  PFN_vkGetSemaphoreFdKHR vkGetSemaphoreFdKHR_ = nullptr;
+  PFN_vkImportSemaphoreFdKHR vkImportSemaphoreFdKHR_ = nullptr;
+  PFN_vkGetAndroidHardwareBufferPropertiesANDROID
+      vkGetAndroidHardwareBufferPropertiesANDROID_ = nullptr;
+  PFN_vkGetPhysicalDeviceImageFormatProperties2
+      vkGetPhysicalDeviceImageFormatProperties2_ = nullptr;
+#endif
   // Set when LogFaultInfo() has already logged - prevents repeat logging from
   // multiple device-loss observers.
   std::atomic_flag fault_info_logged_ = ATOMIC_FLAG_INIT;

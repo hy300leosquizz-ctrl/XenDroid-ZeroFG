@@ -13,12 +13,19 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
+#include "xenia/ui/vulkan/zerofg_config.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+#include "third_party/libadrenotools/include/adrenotools/driver.h"
+#endif
 
 DEFINE_int32(
     vulkan_clamp_storage_buffer_range, 0,
@@ -47,12 +54,130 @@ struct VulkanFeatures {
   }
 };
 
+zerofg::Capabilities::Format VulkanDevice::QueryZeroFGBackendFormat(
+    const VkFormat format, const VkImageUsageFlags usage,
+    const VkImageTiling tiling, const VkImageCreateFlags create_flags,
+    const VkImageViewType view_type) const {
+  zerofg::Capabilities::Format result;
+  result.format = format;
+  result.usage = usage;
+  result.tiling = tiling;
+  result.create_flags = create_flags;
+  result.view_type = view_type;
+  if (!is_zerofg_presenter_device()) return result;
+  const auto& ifn = vulkan_instance_->functions();
+  const auto get_format_properties2 = PFN_vkGetPhysicalDeviceFormatProperties2(
+      ifn.vkGetInstanceProcAddr(vulkan_instance_->instance(),
+                               "vkGetPhysicalDeviceFormatProperties2"));
+  const auto get_image_properties2 =
+      PFN_vkGetPhysicalDeviceImageFormatProperties2(
+          ifn.vkGetInstanceProcAddr(vulkan_instance_->instance(),
+                                   "vkGetPhysicalDeviceImageFormatProperties2"));
+  if (get_format_properties2) {
+    VkFormatProperties3 properties3 = {VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+    VkFormatProperties2 properties2 = {VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
+    properties2.pNext = &properties3;
+    get_format_properties2(physical_device_, format, &properties2);
+    result.optimal_tiling_features = properties3.optimalTilingFeatures;
+  }
+  if (!get_image_properties2) {
+    result.image_query_result = VK_ERROR_EXTENSION_NOT_PRESENT;
+    return result;
+  }
+  VkPhysicalDeviceImageFormatInfo2 image_info = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};
+  image_info.format = format;
+  image_info.type = VK_IMAGE_TYPE_2D;
+  image_info.tiling = tiling;
+  image_info.usage = usage;
+  image_info.flags = create_flags;
+  VkPhysicalDeviceImageViewImageFormatInfoEXT view_info = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_IMAGE_FORMAT_INFO_EXT};
+  view_info.imageViewType = view_type;
+  VkFilterCubicImageViewImageFormatPropertiesEXT cubic_info = {
+      VK_STRUCTURE_TYPE_FILTER_CUBIC_IMAGE_VIEW_IMAGE_FORMAT_PROPERTIES_EXT};
+  VkImageFormatProperties2 image_properties = {
+      VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+  if (zerofg_backend_capabilities_.filter_cubic_supported) {
+    image_info.pNext = &view_info;
+    image_properties.pNext = &cubic_info;
+  }
+  result.image_query_result =
+      get_image_properties2(physical_device_, &image_info, &image_properties);
+  if (result.image_query_result == VK_SUCCESS) {
+    result.cubic = cubic_info.filterCubic != VK_FALSE;
+    result.cubic_minmax = cubic_info.filterCubicMinmax != VK_FALSE;
+  }
+  return result;
+}
+
+bool VulkanDevice::DrainZeroFGForTeardown() {
+  if (!is_zerofg_presenter_device()) return false;
+  if (zerofg_teardown_idle()) return true;
+  // Every enabled queue of B: the main-surface profile adds B:1 for egress.
+  VkResult result = VK_SUCCESS;
+  const size_t queue_count =
+      queue_families_[queue_family_graphics_compute()].queues.size();
+  for (size_t queue_index = 0; queue_index < queue_count; ++queue_index) {
+    auto queue =
+        AcquireQueue(queue_family_graphics_compute(), uint32_t(queue_index));
+    const VkResult queue_result = functions().vkQueueWaitIdle(queue.queue());
+    if (queue_result != VK_SUCCESS && result == VK_SUCCESS) {
+      result = queue_result;
+    }
+  }
+  bool retired = result == VK_SUCCESS;
+  if (result == VK_ERROR_DEVICE_LOST) {
+    SetLost();
+    // A lost device is terminal for B, so child-resource retirement is no
+    // longer required before teardown destroys the device-owned objects.
+    retired = true;
+  } else if (!retired) {
+    // Teardown may block, and a queue-idle error alone is not retirement
+    // proof. Make one explicit device-wide attempt before reporting failure;
+    // the live path never calls either idle operation.
+    const VkResult device_idle_result = vkDeviceWaitIdle()(device());
+    XELOGW("ZeroFGDeviceB teardown_queue_idle fallback_device_idle result={}",
+           int32_t(device_idle_result));
+    retired = device_idle_result == VK_SUCCESS;
+    if (device_idle_result == VK_ERROR_DEVICE_LOST) {
+      SetLost();
+      retired = true;
+    }
+  }
+  zerofg_teardown_idle_.store(retired, std::memory_order_release);
+  XELOGI(
+      "ZeroFGDeviceB teardown_queue_idle result={} retired={} A_untouched=true",
+      int32_t(result), retired);
+  return retired;
+}
+
+bool VulkanDevice::RejectZeroFGSubmitAfterTeardownIdle() {
+  if (!is_zerofg_presenter_device() || !zerofg_teardown_idle()) return false;
+  if (!teardown_submit_rejected_.exchange(true, std::memory_order_acq_rel)) {
+    XELOGE("ZeroFGDeviceB submit_after_teardown_idle rejected");
+  }
+  return true;
+}
+
 std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     const VulkanInstance* const vulkan_instance,
     const VkPhysicalDevice physical_device, const bool with_gpu_emulation,
-    const bool with_swapchain) {
+    const bool with_swapchain, const CreationProfile profile,
+    const ZeroFGBackendFeatureRequests backend_requests) {
   assert_not_null(vulkan_instance);
   assert_not_null(physical_device);
+  // Device B: ZeroFG's own device and the main Surface's WSI producer.
+  const bool presenter_device =
+      profile == CreationProfile::kZeroFGMainSurfacePresenter;
+  // Driver pipeline statistics were a development diagnostic.
+  constexpr bool pipeline_statistics_requested = false;
+  if (presenter_device && (with_gpu_emulation || !with_swapchain)) {
+    XELOGE(
+        "ZeroFGDeviceB invalid creation profile: emulation prohibited, WSI "
+        "required");
+    return nullptr;
+  }
 
   const VulkanInstance::Functions& ifn = vulkan_instance->functions();
 
@@ -92,6 +217,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   VkPhysicalDeviceFeatures supported_features = {};
   ifn.vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
+  if (presenter_device &&
+      (vulkan_instance->api_version() < VK_API_VERSION_1_3 ||
+       properties.apiVersion < VK_API_VERSION_1_3)) {
+    XELOGE("ZeroFGDeviceB requires effective Vulkan 1.3");
+    return nullptr;
+  }
 
   if (with_gpu_emulation) {
     if (!supported_features.independentBlend) {
@@ -116,6 +247,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   std::unique_ptr<VulkanDevice> device(
       new VulkanDevice(vulkan_instance, physical_device));
+  device->creation_profile_ = profile;
+  auto& backend = device->zerofg_backend_capabilities_;
+  backend.effective_api_version = properties.apiVersion;
 
   const bool get_physical_device_properties2_supported =
       vulkan_instance->extensions().ext_1_1_KHR_get_physical_device_properties2;
@@ -149,12 +283,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   bool ext_KHR_portability_subset = false;
   bool ext_1_2_KHR_driver_properties = false;
+  bool ext_1_2_KHR_timeline_semaphore = false;
   if (get_physical_device_properties2_supported) {
     // #164. Must be enabled according to the specification if the physical
     // device is a portability subset one.
     XE_UI_VULKAN_LOCAL_EXTENSION(KHR_portability_subset)
     // #197
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_driver_properties, 1, 2)
+  }
+  if (pipeline_statistics_requested &&
+      get_physical_device_properties2_supported) {
+    XE_UI_VULKAN_STRUCT_EXTENSION(KHR_pipeline_executable_properties)
   }
 
   // Used by the Vulkan Memory Allocator and potentially by Xenia.
@@ -168,6 +307,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (get_physical_device_properties2_supported) {
     // #238.
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_memory_budget)
+    // #208. GPU readiness for Source-first ZeroFG ingest submissions.
+    XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_timeline_semaphore, 1, 2)
   }
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
     // #414.
@@ -178,9 +319,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
   }
 
+  bool ext_GOOGLE_display_timing = false;
   if (with_swapchain) {
     // #2.
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
+    requested_extensions.emplace(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
+                                 &ext_GOOGLE_display_timing);
 #if XE_PLATFORM_WIN32
     // #256. Windows-only extension to control fullscreen exclusive behavior.
     // Used to prevent HDR state corruption during fullscreen transitions.
@@ -204,6 +348,22 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   bool ext_1_3_EXT_subgroup_size_control = false;
   bool ext_KHR_fragment_shader_barycentric = false;
   bool ext_NV_fragment_shader_barycentric = false;
+  bool ext_QCOM_image_processing = false;
+  if (presenter_device) {
+    // Optional backend requests belong exclusively to B. Querying the core
+    // subgroup properties does not itself enable either optional feature.
+    ext_1_3_EXT_subgroup_size_control =
+        properties.apiVersion >= VK_API_VERSION_1_3;
+    if (backend_requests.filter_cubic) {
+      requested_extensions.emplace(VK_EXT_FILTER_CUBIC_EXTENSION_NAME,
+                                   &backend.filter_cubic_enabled);
+    }
+    if (backend_requests.qcom_image_processing ||
+        backend_requests.qcom_block_match) {
+      requested_extensions.emplace(VK_QCOM_IMAGE_PROCESSING_EXTENSION_NAME,
+                                   &ext_QCOM_image_processing);
+    }
+  }
   if (with_gpu_emulation) {
     // #15.
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_sampler_mirror_clamp_to_edge, 1,
@@ -259,7 +419,27 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (get_physical_device_properties2_supported) {
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_external_memory_host)
     }
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+    // ZeroFG's A->B handoff shares Source images with device B as
+    // AHardwareBuffers and synchronizes through sync_files. Request these only
+    // for an opted-in ZeroFG session so the normal XenDroid device extension
+    // set is unchanged when ZeroFG is off.
+    if (IsZeroFGRequested() &&
+        properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
+      XE_UI_VULKAN_STRUCT_EXTENSION(
+          ANDROID_external_memory_android_hardware_buffer)
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_external_semaphore_fd)
+    }
+#endif
   }
+
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  if (presenter_device) {
+    XE_UI_VULKAN_STRUCT_EXTENSION(
+        ANDROID_external_memory_android_hardware_buffer)
+    XE_UI_VULKAN_STRUCT_EXTENSION(KHR_external_semaphore_fd)
+  }
+#endif
 
 #undef XE_UI_VULKAN_STRUCT_EXTENSION
 #undef XE_UI_VULKAN_LOCAL_EXTENSION
@@ -267,6 +447,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION
 
   std::vector<const char*> enabled_extensions;
+  bool zerofg_display_timing_available = false;
+  // Device B asks for a high queue priority through the driver as well
+  // (VK_KHR/EXT_global_priority), for drivers that honour it.
+  bool global_priority_khr = false;
+  bool global_priority_ext = false;
   {
     uint32_t supported_extension_count = 0;
     const VkResult get_supported_extension_count_result =
@@ -291,6 +476,44 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       assert_true(supported_extension_count == supported_extensions.size());
       for (const VkExtensionProperties& supported_extension :
            supported_extensions) {
+        if (presenter_device) {
+          const char* name = supported_extension.extensionName;
+          if (!std::strcmp(name, VK_EXT_FILTER_CUBIC_EXTENSION_NAME)) {
+            backend.filter_cubic_supported = true;
+          } else if (!std::strcmp(name,
+                                 VK_QCOM_IMAGE_PROCESSING_EXTENSION_NAME)) {
+            backend.qcom_image_processing_supported = true;
+          } else if (!std::strcmp(name,
+                                 VK_QCOM_IMAGE_PROCESSING_2_EXTENSION_NAME)) {
+            backend.qcom_image_processing2_advertised = true;
+          } else if (!std::strcmp(name, "VK_QCOM_image_processing3")) {
+            backend.qcom_image_processing3_advertised = true;
+          } else if (!std::strcmp(name,
+                                 VK_QCOM_FILTER_CUBIC_WEIGHTS_EXTENSION_NAME)) {
+            backend.qcom_cubic_weights_advertised = true;
+          } else if (!std::strcmp(name,
+                                 VK_QCOM_FILTER_CUBIC_CLAMP_EXTENSION_NAME)) {
+            backend.qcom_cubic_clamp_advertised = true;
+          }
+        }
+        if (presenter_device &&
+            !std::strcmp(supported_extension.extensionName,
+                         VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+          device->properties_.pipelineExecutablePropertiesAdvertised = true;
+        }
+        if (!std::strcmp(supported_extension.extensionName,
+                         VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME)) {
+          zerofg_display_timing_available = true;
+        }
+        if (presenter_device) {
+          const char* name = supported_extension.extensionName;
+          if (!std::strcmp(name, VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME)) {
+            global_priority_khr = true;
+          } else if (!std::strcmp(name,
+                                  VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME)) {
+            global_priority_ext = true;
+          }
+        }
         const auto requested_extension_it =
             requested_extensions.find(supported_extension.extensionName);
         if (requested_extension_it == requested_extensions.cend()) {
@@ -310,6 +533,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XELOGW("Vulkan device '{}' doesn't support swapchains",
            properties.deviceName);
     return nullptr;
+  }
+  if (global_priority_khr) {
+    enabled_extensions.push_back(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME);
+  } else if (global_priority_ext) {
+    enabled_extensions.push_back(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME);
   }
 
   VkDeviceCreateInfo device_create_info = {
@@ -340,12 +568,19 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceHostQueryResetFeatures,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES>
       features_EXT_host_query_reset;
+  VulkanFeatures<VkPhysicalDeviceTimelineSemaphoreFeatures,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES>
+      features_KHR_timeline_semaphore;
   VulkanFeatures<VkPhysicalDeviceShaderFloat16Int8Features,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES>
       features_KHR_shader_float16_int8;
   VulkanFeatures<VkPhysicalDeviceVulkan13Features,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES>
       features_1_3;
+  VulkanFeatures<
+      VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR,
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR>
+      features_KHR_pipeline_executable_properties;
   VulkanFeatures<
       VkPhysicalDevicePortabilitySubsetFeaturesKHR,
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR>
@@ -414,7 +649,63 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       properties_EXT_external_memory_host = {
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
 
+  // All QCOM probe structures are linked for supported queries only. v2,
+  // cubic weights/clamp are never linked to device creation in this batch.
+  VkPhysicalDeviceImageProcessingFeaturesQCOM features_qcom = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM};
+  VkPhysicalDeviceImageProcessingFeaturesQCOM enabled_qcom = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM};
+  VkPhysicalDeviceImageProcessingPropertiesQCOM properties_qcom = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_PROPERTIES_QCOM};
+  VkPhysicalDeviceImageProcessing2FeaturesQCOM features_qcom2 = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_2_FEATURES_QCOM};
+  VkPhysicalDeviceImageProcessing2PropertiesQCOM properties_qcom2 = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_2_PROPERTIES_QCOM};
+  VkPhysicalDeviceCubicWeightsFeaturesQCOM features_cubic_weights = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUBIC_WEIGHTS_FEATURES_QCOM};
+  VkPhysicalDeviceCubicClampFeaturesQCOM features_cubic_clamp = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUBIC_CLAMP_FEATURES_QCOM};
+  VkPhysicalDeviceShaderIntegerDotProductProperties properties_dot_product = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES};
+  VkPhysicalDeviceSamplerFilterMinmaxProperties properties_minmax = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES};
+
   if (get_physical_device_properties2_supported) {
+    if (presenter_device) {
+      const auto link_feature_query = [&](auto& feature) {
+        feature.pNext = supported_features_2.pNext;
+        supported_features_2.pNext = &feature;
+      };
+      const auto link_property_query = [&](auto& property) {
+        property.pNext = properties_2.pNext;
+        properties_2.pNext = &property;
+      };
+      link_property_query(properties_dot_product);
+      link_property_query(properties_minmax);
+      if (backend.qcom_image_processing_supported) {
+        link_feature_query(features_qcom);
+        link_property_query(properties_qcom);
+      }
+      if (backend.qcom_image_processing2_advertised) {
+        link_feature_query(features_qcom2);
+        link_property_query(properties_qcom2);
+      }
+      if (backend.qcom_cubic_weights_advertised) {
+        link_feature_query(features_cubic_weights);
+      }
+      if (backend.qcom_cubic_clamp_advertised) {
+        link_feature_query(features_cubic_clamp);
+      }
+    }
+    if (presenter_device &&
+        device->properties_.pipelineExecutablePropertiesAdvertised) {
+      // Query support without enabling the feature. The enabled pNext is
+      // linked only after this query proves support and the Test opt-in.
+      features_KHR_pipeline_executable_properties.supported.pNext =
+          supported_features_2.pNext;
+      supported_features_2.pNext =
+          &features_KHR_pipeline_executable_properties.supported;
+    }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
       features_1_1.Link(supported_features_2, device_create_info);
     }
@@ -428,6 +719,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       if (ext_1_2_KHR_shader_float16_int8) {
         features_KHR_shader_float16_int8.Link(supported_features_2,
                                               device_create_info);
+      }
+      if (ext_1_2_KHR_timeline_semaphore) {
+        features_KHR_timeline_semaphore.Link(supported_features_2,
+                                             device_create_info);
       }
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
@@ -507,6 +802,36 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
+    device->properties_.pipelineExecutableInfoSupported =
+        features_KHR_pipeline_executable_properties.supported
+            .pipelineExecutableInfo != VK_FALSE;
+    if (pipeline_statistics_requested &&
+        device->extensions_.ext_KHR_pipeline_executable_properties &&
+        device->properties_.pipelineExecutableInfoSupported) {
+      features_KHR_pipeline_executable_properties.enabled
+          .pipelineExecutableInfo = VK_TRUE;
+      features_KHR_pipeline_executable_properties.enabled.pNext =
+          const_cast<void*>(device_create_info.pNext);
+      device_create_info.pNext =
+          &features_KHR_pipeline_executable_properties.enabled;
+      device->properties_.pipelineExecutableInfo = true;
+    } else if (device->extensions_.ext_KHR_pipeline_executable_properties) {
+      // Extension advertisement alone must not change the logical-device
+      // extension set when its diagnostic feature cannot be enabled.
+      enabled_extensions.erase(
+          std::remove_if(
+              enabled_extensions.begin(), enabled_extensions.end(),
+              [](const char* name) {
+                return !std::strcmp(
+                    name,
+                    VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+              }),
+          enabled_extensions.end());
+      device_create_info.enabledExtensionCount =
+          uint32_t(enabled_extensions.size());
+      device_create_info.ppEnabledExtensionNames = enabled_extensions.data();
+      device->extensions_.ext_KHR_pipeline_executable_properties = false;
+    }
     // Mirror supported deviceFault into the enabled struct so the driver
     // collects fault info during normal execution. Disable the extension flag
     // if the feature wasn't actually supported - vkGetDeviceFaultInfoEXT is
@@ -539,6 +864,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     QueueFamily& queue_family = device->queue_families_[queue_family_index];
     const VkQueueFamilyProperties& queue_family_properties =
         queue_families[queue_family_index];
+    queue_family.physical_queue_count = queue_family_properties.queueCount;
+    queue_family.timestamp_valid_bits =
+        queue_family_properties.timestampValidBits;
 
     const VkQueueFlags queue_unsupported_flags =
         ~queue_family_properties.queueFlags;
@@ -581,8 +909,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       queue_family.may_support_presentation = true;
 #endif
       if (queue_family.may_support_presentation) {
-        queue_family.queues.resize(
-            std::max(size_t(1), queue_family.queues.size()));
+        // Device B presents from its graphics/compute family only; an idle
+        // queue on another family would be one more KGSL context for nothing.
+        if (!presenter_device) {
+          queue_family.queues.resize(
+              std::max(size_t(1), queue_family.queues.size()));
+        }
         has_presentation_queue_family = true;
       }
     }
@@ -624,9 +956,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     supported_features.sparseResidencyAliased = VK_FALSE;
   }
 
-  // Prefer using one queue for everything whenever possible for simplicity.
-  // TODO(Triang3l): Research if separate queues for purposes like composition,
-  // swapchain image presentation, and sparse binding, may be beneficial.
+  // Prefer using one queue for the normal XenDroid paths. The independent
+  // presenter is the one exception: when opted in and physically available,
+  // enable queue 1 from the
+  // same graphics/compute family so its submissions don't share Vulkan's
+  // per-queue host-synchronization mutex with the sovereign Source queue 0.
+  // This does not assume that the implementation executes the queues in
+  // parallel; it only provides distinct VkQueue host submission domains.
 
   if (first_queue_family_graphics_compute_sparse_binding != UINT32_MAX) {
     device->queue_family_graphics_compute_ =
@@ -639,10 +975,29 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     device->queue_family_sparse_binding_ = first_queue_family_sparse_binding;
   }
 
-  device->queue_families_[device->queue_family_graphics_compute_].queues.resize(
-      std::max(size_t(1),
-               device->queue_families_[device->queue_family_graphics_compute_]
-                   .queues.size()));
+  QueueFamily& graphics_compute_queue_family =
+      device->queue_families_[device->queue_family_graphics_compute_];
+  size_t graphics_compute_queue_count = 1;
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  // Device B: queue 1 for Main Surface egress, so copy/present is its own
+  // KGSL context and the Generation/Post backlog on B:0 cannot drag it.
+  // Device A keeps XenDroid's normal queue request.
+  if (presenter_device) {
+    graphics_compute_queue_count = std::min(
+        size_t(2), size_t(graphics_compute_queue_family.physical_queue_count));
+  }
+#endif
+  graphics_compute_queue_family.queues.resize(
+      std::max(graphics_compute_queue_count,
+               graphics_compute_queue_family.queues.size()));
+  XELOGI(
+      "VulkanDevice: graphics/compute family {} physical queues={} enabled "
+      "queues={} ZeroFG presenter queue={} main surface egress queue={}",
+      device->queue_family_graphics_compute_,
+      graphics_compute_queue_family.physical_queue_count,
+      graphics_compute_queue_family.queues.size(),
+      device->queue_index_zerofg_presenter(),
+      device->queue_index_zerofg_main_surface_present());
   if (device->queue_family_sparse_binding_ != UINT32_MAX) {
     device->queue_families_[device->queue_family_sparse_binding_].queues.resize(
         std::max(size_t(1),
@@ -672,6 +1027,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   const std::vector<float> queue_priorities(max_enabled_queues_per_family,
                                             1.0f);
+  // Device B's work must not wait behind the game's on a saturated GPU: its
+  // queues ask the driver for a high global priority (the game stays at the
+  // default medium). Turnip's KGSL backend ignores it; the adrenotools hook
+  // below covers that driver.
+  const bool request_global_priority =
+      presenter_device && (global_priority_khr || global_priority_ext);
+  VkDeviceQueueGlobalPriorityCreateInfoKHR global_priority_info = {
+      VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR};
+  global_priority_info.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR;
   std::vector<VkDeviceQueueCreateInfo> queue_create_infos;
   for (size_t queue_family_index = 0;
        queue_family_index < device->queue_families_.size();
@@ -684,7 +1048,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     VkDeviceQueueCreateInfo& queue_create_info =
         queue_create_infos.emplace_back();
     queue_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    queue_create_info.pNext = nullptr;
+    queue_create_info.pNext =
+        request_global_priority ? &global_priority_info : nullptr;
     queue_create_info.flags = 0;
     queue_create_info.queueFamilyIndex = uint32_t(queue_family_index);
     queue_create_info.queueCount = uint32_t(queue_family.queues.size());
@@ -838,8 +1203,22 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(sparseBinding)
     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
   }
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  if ((with_gpu_emulation && IsZeroFGRequested()) || presenter_device) {
+    XE_UI_VULKAN_FEATURE(shaderStorageImageExtendedFormats)
+  }
+#endif
+  if (presenter_device) {
+    // Existing host Post system shaders declare Int16/Float16. This is a
+    // host-pipeline requirement, not a new RC1 Compat algorithm capability.
+    XE_UI_VULKAN_FEATURE(shaderInt16)
+  }
 
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+    XE_UI_VULKAN_FEATURE_2(features_1_2, timelineSemaphore);
+    if (presenter_device) {
+      XE_UI_VULKAN_FEATURE_2(features_1_2, shaderFloat16);
+    }
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
@@ -848,6 +1227,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, shaderFloat16);
     }
   } else {
+    if (ext_1_2_KHR_timeline_semaphore) {
+      XE_UI_VULKAN_FEATURE_2(features_KHR_timeline_semaphore,
+                             timelineSemaphore);
+    }
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
       XE_UI_VULKAN_FEATURE_IMPLIED(samplerMirrorClampToEdge)
     }
@@ -860,6 +1243,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   device->extensions_.ext_1_2_EXT_host_query_reset =
       ext_1_2_EXT_host_query_reset;
+  device->extensions_.ext_1_2_KHR_timeline_semaphore =
+      ext_1_2_KHR_timeline_semaphore;
 
   // shaderDrawParameters (Vulkan 1.1). Needed by shaders reading SV_VertexID
   // with Direct3D semantics, which are compiled to VertexIndex minus BaseVertex
@@ -878,6 +1263,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_3, shaderDemoteToHelperInvocation);
       XE_UI_VULKAN_FEATURE_2(features_1_3, dynamicRendering);
     }
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+    if ((with_gpu_emulation && IsZeroFGRequested()) || presenter_device) {
+      XE_UI_VULKAN_FEATURE_2(features_1_3, synchronization2);
+    }
+#endif
   } else {
     if (ext_1_3_EXT_shader_demote_to_helper_invocation) {
       if (with_gpu_emulation) {
@@ -981,6 +1371,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
                             minSubgroupSize);
     XE_UI_VULKAN_PROPERTY_2(properties_1_3_EXT_subgroup_size_control,
                             maxSubgroupSize);
+    XE_UI_VULKAN_PROPERTY_2(properties_1_3_EXT_subgroup_size_control,
+                            maxComputeWorkgroupSubgroups);
     if (with_gpu_emulation) {
       // On Vulkan 1.3 these are enabled through
       // VkPhysicalDeviceVulkan13Features.
@@ -1018,6 +1410,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
                              fragmentShaderBarycentric);
     }
   }
+
   device->extensions_.ext_KHR_fragment_shader_barycentric =
       (ext_KHR_fragment_shader_barycentric ||
        ext_NV_fragment_shader_barycentric) &&
@@ -1065,10 +1458,158 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_ENUM_PROPERTY_2
 #undef XE_UI_VULKAN_FEATURE_2
 
+  if (presenter_device) {
+    backend.synchronization2_enabled = device->properties_.synchronization2;
+    backend.shader_storage_image_extended_formats_enabled =
+        device->properties_.shaderStorageImageExtendedFormats;
+    backend.pipeline_executable_extension_advertised =
+        device->properties_.pipelineExecutablePropertiesAdvertised;
+    backend.pipeline_executable_feature_supported =
+        device->properties_.pipelineExecutableInfoSupported;
+    backend.pipeline_executable_feature_enabled =
+        device->properties_.pipelineExecutableInfo;
+    backend.shader_float16_supported = features_1_2.supported.shaderFloat16;
+    backend.shader_float16_enabled = features_1_2.enabled.shaderFloat16;
+    backend.shader_int8_supported = features_1_2.supported.shaderInt8;
+    backend.shader_int8_enabled = features_1_2.enabled.shaderInt8;
+    backend.shader_int16_supported = supported_features.shaderInt16;
+    backend.shader_int16_enabled = enabled_features.shaderInt16;
+    backend.storage_buffer_16bit_access_supported =
+        features_1_1.supported.storageBuffer16BitAccess;
+    // A backend request must not implicitly enable unrelated storage features.
+    backend.storage_buffer_16bit_access_enabled =
+        features_1_1.enabled.storageBuffer16BitAccess;
+    backend.subgroup_size = properties_subgroup.subgroupSize;
+    backend.subgroup_min_size =
+        properties_1_3_EXT_subgroup_size_control.minSubgroupSize;
+    backend.subgroup_max_size =
+        properties_1_3_EXT_subgroup_size_control.maxSubgroupSize;
+    backend.max_compute_workgroup_subgroups =
+        properties_1_3_EXT_subgroup_size_control.maxComputeWorkgroupSubgroups;
+    backend.subgroup_supported_stages = properties_subgroup.supportedStages;
+    backend.subgroup_supported_operations =
+        properties_subgroup.supportedOperations;
+    backend.subgroup_size_control_supported =
+        features_1_3.supported.subgroupSizeControl;
+    backend.compute_full_subgroups_supported =
+        features_1_3.supported.computeFullSubgroups;
+    backend.required_subgroup_size_stages =
+        properties_1_3_EXT_subgroup_size_control.requiredSubgroupSizeStages;
+    backend.maintenance4_supported = features_1_3.supported.maintenance4;
+    backend.maintenance4_enabled = features_1_3.enabled.maintenance4;
+    backend.subgroup_size_control_enabled =
+        features_1_3.enabled.subgroupSizeControl;
+    backend.compute_full_subgroups_enabled =
+        features_1_3.enabled.computeFullSubgroups;
+    device->properties_.subgroupSizeControl =
+        backend.subgroup_size_control_enabled;
+    device->properties_.computeFullSubgroups =
+        backend.compute_full_subgroups_enabled;
+    backend.shader_integer_dot_product_supported =
+        features_1_3.supported.shaderIntegerDotProduct;
+    backend.shader_integer_dot_product_enabled =
+        features_1_3.enabled.shaderIntegerDotProduct;
+    backend.integer_dot_product_4x8_unsigned_accelerated =
+        properties_dot_product.integerDotProduct4x8BitPackedUnsignedAccelerated;
+    backend.integer_dot_product_4x8_signed_accelerated =
+        properties_dot_product.integerDotProduct4x8BitPackedSignedAccelerated;
+    backend.integer_dot_product_4x8_mixed_signedness_accelerated =
+        properties_dot_product
+            .integerDotProduct4x8BitPackedMixedSignednessAccelerated;
+    backend.sampler_filter_minmax_supported =
+        features_1_2.supported.samplerFilterMinmax;
+    backend.sampler_filter_minmax_enabled =
+        features_1_2.enabled.samplerFilterMinmax;
+    backend.filter_minmax_single_component_formats =
+        properties_minmax.filterMinmaxSingleComponentFormats;
+    backend.filter_minmax_image_component_mapping =
+        properties_minmax.filterMinmaxImageComponentMapping;
+    backend.qcom_texture_sample_weighted_supported =
+        features_qcom.textureSampleWeighted;
+    backend.qcom_texture_box_filter_supported = features_qcom.textureBoxFilter;
+    backend.qcom_texture_block_match_supported = features_qcom.textureBlockMatch;
+    enabled_qcom.textureBlockMatch = backend_requests.qcom_block_match &&
+        features_qcom.textureBlockMatch;
+    // Weighted sampling and the box filter are queried only; block match is
+    // the one QCOM image-processing feature a backend requests.
+    if (ext_QCOM_image_processing && enabled_qcom.textureBlockMatch) {
+      enabled_qcom.pNext = const_cast<void*>(device_create_info.pNext);
+      device_create_info.pNext = &enabled_qcom;
+      backend.qcom_image_processing_enabled = true;
+    } else if (ext_QCOM_image_processing) {
+      // No usable feature: leave advertisement visible but do not enable it.
+      enabled_extensions.erase(
+          std::remove_if(enabled_extensions.begin(), enabled_extensions.end(),
+                         [](const char* name) {
+                           return !std::strcmp(
+                               name, VK_QCOM_IMAGE_PROCESSING_EXTENSION_NAME);
+                         }),
+          enabled_extensions.end());
+    }
+    backend.qcom_texture_sample_weighted_enabled =
+        enabled_qcom.textureSampleWeighted;
+    backend.qcom_texture_box_filter_enabled = enabled_qcom.textureBoxFilter;
+    backend.qcom_texture_block_match_enabled = enabled_qcom.textureBlockMatch;
+    backend.qcom_max_weight_filter_phases = properties_qcom.maxWeightFilterPhases;
+    backend.qcom_max_weight_filter_dimension =
+        properties_qcom.maxWeightFilterDimension;
+    backend.qcom_max_block_match_region = properties_qcom.maxBlockMatchRegion;
+    backend.qcom_max_box_filter_block_size = properties_qcom.maxBoxFilterBlockSize;
+    backend.qcom_texture_block_match2_supported = features_qcom2.textureBlockMatch2;
+    backend.qcom_max_block_match_window = properties_qcom2.maxBlockMatchWindow;
+    backend.qcom_selectable_cubic_weights_supported =
+        features_cubic_weights.selectableCubicWeights;
+    backend.qcom_cubic_range_clamp_supported = features_cubic_clamp.cubicRangeClamp;
+    device_create_info.enabledExtensionCount = uint32_t(enabled_extensions.size());
+    device_create_info.ppEnabledExtensionNames = enabled_extensions.data();
+  }
+
   // Create the device.
 
-  const VkResult device_create_result = ifn.vkCreateDevice(
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  // ZeroFG's device asks KGSL for a higher priority than the game's (KGSL's
+  // default 8): on a saturated GPU its small work then runs first instead of
+  // waiting behind the game's frames and completing in clumps (a copy of 8 ms
+  // took 40-170 ms, Arkham GT off, 2026-10-07). Turnip creates its KGSL draw
+  // context without one, so the adrenotools hook sets it during this call.
+  // 4 is the second of the four levels: above the game, below the top level.
+  constexpr uint32_t kZeroFGKgslContextPriority = 4;
+  const uint32_t contexts_raised_before =
+      presenter_device ? adrenotools_context_priority_raised() : 0;
+  if (presenter_device) {
+    adrenotools_set_context_priority(kZeroFGKgslContextPriority);
+  }
+#endif
+  VkResult device_create_result = ifn.vkCreateDevice(
       physical_device, &device_create_info, nullptr, &device->device_);
+  const char* global_priority_state =
+      request_global_priority ? "high" : "unsupported";
+  if (request_global_priority &&
+      (device_create_result == VK_ERROR_NOT_PERMITTED_KHR ||
+       device_create_result == VK_ERROR_INITIALIZATION_FAILED)) {
+    // A driver may refuse a high priority to an application: B at the
+    // default priority is still B.
+    global_priority_state = "refused";
+    for (VkDeviceQueueCreateInfo& queue_create_info : queue_create_infos) {
+      queue_create_info.pNext = nullptr;
+    }
+    device_create_result = ifn.vkCreateDevice(
+        physical_device, &device_create_info, nullptr, &device->device_);
+  }
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  if (presenter_device) {
+    adrenotools_set_context_priority(0);
+    XELOGI(
+        "ZeroFGDeviceB vk_global_priority={} kgsl_priority requested={} "
+        "contexts_raised={}",
+        global_priority_state, kZeroFGKgslContextPriority,
+        adrenotools_context_priority_raised() - contexts_raised_before);
+  }
+#else
+  if (presenter_device) {
+    XELOGI("ZeroFGDeviceB vk_global_priority={}", global_priority_state);
+  }
+#endif
   if (device_create_result != VK_SUCCESS) {
     XELOGE(
         "Failed to create a Vulkan logical device from the physical device "
@@ -1199,10 +1740,132 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+  // Observational display-timing entry points. Missing pointers only disable
+  // the probe; they must not make logical-device creation fail.
+  if (ext_GOOGLE_display_timing) {
+    device->vkGetRefreshCycleDurationGOOGLE_ =
+        PFN_vkGetRefreshCycleDurationGOOGLE(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkGetRefreshCycleDurationGOOGLE"));
+    device->vkGetPastPresentationTimingGOOGLE_ =
+        PFN_vkGetPastPresentationTimingGOOGLE(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkGetPastPresentationTimingGOOGLE"));
+    if (!device->vkGetRefreshCycleDurationGOOGLE_ ||
+        !device->vkGetPastPresentationTimingGOOGLE_) {
+      device->vkGetRefreshCycleDurationGOOGLE_ = nullptr;
+      device->vkGetPastPresentationTimingGOOGLE_ = nullptr;
+    }
+  }
+
+  // Optional diagnostic entry points. Failure here disables statistics only:
+  // it must not join the generic device function-loading failure authority.
+  if (device->properties_.pipelineExecutableInfo) {
+    device->vkGetPipelineExecutablePropertiesKHR_ =
+        PFN_vkGetPipelineExecutablePropertiesKHR(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkGetPipelineExecutablePropertiesKHR"));
+    device->vkGetPipelineExecutableStatisticsKHR_ =
+        PFN_vkGetPipelineExecutableStatisticsKHR(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkGetPipelineExecutableStatisticsKHR"));
+    if (!device->vkGetPipelineExecutablePropertiesKHR_ ||
+        !device->vkGetPipelineExecutableStatisticsKHR_) {
+      device->vkGetPipelineExecutablePropertiesKHR_ = nullptr;
+      device->vkGetPipelineExecutableStatisticsKHR_ = nullptr;
+      XELOGW("ZeroFGPipelineStats unavailable reason=query_entry_points");
+    }
+  }
+
+  device->vkDeviceWaitIdle_ = PFN_vkDeviceWaitIdle(
+      ifn.vkGetDeviceProcAddr(device->device_, "vkDeviceWaitIdle"));
+  if (device->properties_.synchronization2) {
+    device->vkCmdPipelineBarrier2_ = PFN_vkCmdPipelineBarrier2(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkCmdPipelineBarrier2"));
+  }
+  if (device->properties_.timelineSemaphore) {
+    const char* counter_function_name =
+        properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)
+            ? "vkGetSemaphoreCounterValue"
+            : "vkGetSemaphoreCounterValueKHR";
+    device->vkGetSemaphoreCounterValue_ = PFN_vkGetSemaphoreCounterValue(
+        ifn.vkGetDeviceProcAddr(device->device_, counter_function_name));
+    const char* wait_function_name =
+        properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)
+            ? "vkWaitSemaphores"
+            : "vkWaitSemaphoresKHR";
+    device->vkWaitSemaphores_ = PFN_vkWaitSemaphores(
+        ifn.vkGetDeviceProcAddr(device->device_, wait_function_name));
+    if (!device->vkGetSemaphoreCounterValue_ ||
+        !device->vkWaitSemaphores_) {
+      device->properties_.timelineSemaphore = false;
+    }
+  }
+
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  if (device->extensions_.ext_KHR_external_semaphore_fd) {
+    device->vkGetSemaphoreFdKHR_ = PFN_vkGetSemaphoreFdKHR(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkGetSemaphoreFdKHR"));
+    device->vkImportSemaphoreFdKHR_ = PFN_vkImportSemaphoreFdKHR(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkImportSemaphoreFdKHR"));
+    if (!device->vkGetSemaphoreFdKHR_) {
+      device->extensions_.ext_KHR_external_semaphore_fd = false;
+    }
+  }
+  if (device->extensions_.ext_ANDROID_external_memory_android_hardware_buffer) {
+    device->vkGetAndroidHardwareBufferPropertiesANDROID_ =
+        PFN_vkGetAndroidHardwareBufferPropertiesANDROID(
+            ifn.vkGetDeviceProcAddr(
+                device->device_,
+                "vkGetAndroidHardwareBufferPropertiesANDROID"));
+    const char* image_format_properties_function_name =
+        properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)
+            ? "vkGetPhysicalDeviceImageFormatProperties2"
+            : "vkGetPhysicalDeviceImageFormatProperties2KHR";
+    device->vkGetPhysicalDeviceImageFormatProperties2_ =
+        PFN_vkGetPhysicalDeviceImageFormatProperties2(
+            ifn.vkGetInstanceProcAddr(vulkan_instance->instance(),
+                                      image_format_properties_function_name));
+    if (!device->vkGetAndroidHardwareBufferPropertiesANDROID_ ||
+        !device->vkGetPhysicalDeviceImageFormatProperties2_) {
+      device->extensions_.ext_ANDROID_external_memory_android_hardware_buffer =
+          false;
+    }
+  }
+#endif
+
   if (!functions_loaded) {
     XELOGE("Failed to get all Vulkan device function pointers for '{}'",
            properties.deviceName);
     return nullptr;
+  }
+
+  if (presenter_device) {
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+    const auto& p = device->properties_;
+    if (!p.synchronization2 || !device->vkCmdPipelineBarrier2_ ||
+        !device->vkDeviceWaitIdle_ || !p.timelineSemaphore || !p.shaderInt16 ||
+        !p.shaderFloat16 || !features_1_1.enabled.shaderDrawParameters ||
+        !device->vkImportSemaphoreFdKHR_ || !device->vkGetSemaphoreFdKHR_ ||
+        !device->extensions_
+             .ext_ANDROID_external_memory_android_hardware_buffer) {
+      XELOGE("ZeroFGDeviceB required host feature/extension unavailable");
+      return nullptr;
+    }
+    if (!device->extensions_.ext_KHR_swapchain) {
+      XELOGE("ZeroFGDeviceB without VK_KHR_swapchain");
+      return nullptr;
+    }
+    XELOGI(
+        "ZeroFGDeviceB enabled sync2={} timeline={} int16={} float16={} "
+        "storage_extended={} draw_parameters={} queues={} wsi={} "
+        "display_timing={}",
+        p.synchronization2, p.timelineSemaphore, p.shaderInt16, p.shaderFloat16,
+        p.shaderStorageImageExtendedFormats,
+        bool(features_1_1.enabled.shaderDrawParameters),
+        device->queue_families_[device->queue_family_graphics_compute_]
+            .queues.size(),
+        device->extensions_.ext_KHR_swapchain,
+        device->vkGetPastPresentationTimingGOOGLE_ != nullptr);
+#else
+    return nullptr;
+#endif
   }
 
   // Get the queues.
@@ -1285,6 +1948,107 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+  XELOGI("ZeroFGProbe: VK_GOOGLE_display_timing available={}",
+         zerofg_display_timing_available ? "YES" : "NO");
+  XELOGI("ZeroFGProbe: VK_GOOGLE_display_timing enabled={}",
+         ext_GOOGLE_display_timing ? "YES" : "NO");
+  if (presenter_device) {
+    const VkFormat formats[] = {
+        VK_FORMAT_R8_UNORM, VK_FORMAT_R16_SFLOAT, VK_FORMAT_R32_SFLOAT,
+        VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_R8G8B8A8_UNORM,
+        VK_FORMAT_R16_UNORM};
+    std::string format_summary;
+    for (size_t i = 0; i < std::size(formats); ++i) {
+      backend.backend_formats[i] = device->QueryZeroFGBackendFormat(
+          formats[i], VK_IMAGE_USAGE_SAMPLED_BIT);
+      const auto& f = backend.backend_formats[i];
+      const auto bits = f.optimal_tiling_features;
+      format_summary += fmt::format(
+          "{}[format={},usage={},flags={},tiling={},view={},status={},"
+          "cubic={},cubic_minmax={},features={},block_match={},box_filter={},"
+          "weight_sampled={},weight_image={}]",
+          i ? ";" : "", int32_t(f.format), f.usage, f.create_flags,
+          int32_t(f.tiling), int32_t(f.view_type), int32_t(f.image_query_result),
+          f.cubic, f.cubic_minmax, uint64_t(bits),
+          bool(bits & VK_FORMAT_FEATURE_2_BLOCK_MATCHING_BIT_QCOM),
+          bool(bits & VK_FORMAT_FEATURE_2_BOX_FILTER_SAMPLED_BIT_QCOM),
+          bool(bits & VK_FORMAT_FEATURE_2_WEIGHT_SAMPLED_IMAGE_BIT_QCOM),
+          bool(bits & VK_FORMAT_FEATURE_2_WEIGHT_IMAGE_BIT_QCOM));
+    }
+    XELOGI(
+        "ZeroFGBackendCapabilities api={} api_physical={} driverID={} driverName={} "
+        "driverInfo={} shaderFloat16={}/{} shaderInt8={}/{} shaderInt16={}/{} "
+        "storageBuffer16BitAccess={}/{} subgroup_size={} subgroup_min={} "
+        "subgroup_max={} subgroup_workgroup_groups={} subgroup_stages={} "
+        "subgroup_operations={} "
+        "subgroupSizeControl={}/{} computeFullSubgroups={}/{} "
+        "maintenance4={}/{} "
+        "requiredSubgroupSizeStages={} shaderIntegerDotProduct={}/{} "
+        "dot4x8_unsigned_accelerated={} dot4x8_signed_accelerated={} "
+        "dot4x8_mixed_accelerated={} filter_cubic={}/{} "
+        "sampler_filter_minmax={}/{} minmax_single_component={} "
+        "minmax_component_mapping={} qcom_image_processing={}/{} "
+        "qcom_weighted={}/{} qcom_box={}/{} qcom_block_match={}/{} "
+        "maxWeightFilterPhases={} maxWeightFilterDimension={}x{} "
+        "maxBlockMatchRegion={}x{} maxBoxFilterBlockSize={}x{} "
+        "qcom_v2_advertised={} textureBlockMatch2={} maxBlockMatchWindow={}x{} "
+        "qcom_v3_advertised={} qcom_v3_features=header_unavailable "
+        "qcom_cubic_weights_advertised={} selectableCubicWeights={} "
+        "qcom_cubic_clamp_advertised={} cubicRangeClamp={} "
+        "probe_only_v2_v3_cubic=true supported_enabled_order=true formats={}",
+        backend.effective_api_version, unclamped_api_version,
+        uint32_t(properties_1_2_KHR_driver_properties.driverID),
+        properties_1_2_KHR_driver_properties.driverName,
+        properties_1_2_KHR_driver_properties.driverInfo,
+        backend.shader_float16_supported, backend.shader_float16_enabled,
+        backend.shader_int8_supported, backend.shader_int8_enabled,
+        backend.shader_int16_supported, backend.shader_int16_enabled,
+        backend.storage_buffer_16bit_access_supported,
+        backend.storage_buffer_16bit_access_enabled, backend.subgroup_size,
+        backend.subgroup_min_size, backend.subgroup_max_size,
+        backend.max_compute_workgroup_subgroups,
+        backend.subgroup_supported_stages, backend.subgroup_supported_operations,
+        backend.subgroup_size_control_supported,
+        backend.subgroup_size_control_enabled,
+        backend.compute_full_subgroups_supported,
+        backend.compute_full_subgroups_enabled,
+        backend.maintenance4_supported, backend.maintenance4_enabled,
+        backend.required_subgroup_size_stages,
+        backend.shader_integer_dot_product_supported,
+        backend.shader_integer_dot_product_enabled,
+        backend.integer_dot_product_4x8_unsigned_accelerated,
+        backend.integer_dot_product_4x8_signed_accelerated,
+        backend.integer_dot_product_4x8_mixed_signedness_accelerated,
+        backend.filter_cubic_supported, backend.filter_cubic_enabled,
+        backend.sampler_filter_minmax_supported,
+        backend.sampler_filter_minmax_enabled,
+        backend.filter_minmax_single_component_formats,
+        backend.filter_minmax_image_component_mapping,
+        backend.qcom_image_processing_supported,
+        backend.qcom_image_processing_enabled,
+        backend.qcom_texture_sample_weighted_supported,
+        backend.qcom_texture_sample_weighted_enabled,
+        backend.qcom_texture_box_filter_supported,
+        backend.qcom_texture_box_filter_enabled,
+        backend.qcom_texture_block_match_supported,
+        backend.qcom_texture_block_match_enabled,
+        backend.qcom_max_weight_filter_phases,
+        backend.qcom_max_weight_filter_dimension.width,
+        backend.qcom_max_weight_filter_dimension.height,
+        backend.qcom_max_block_match_region.width,
+        backend.qcom_max_block_match_region.height,
+        backend.qcom_max_box_filter_block_size.width,
+        backend.qcom_max_box_filter_block_size.height,
+        backend.qcom_image_processing2_advertised,
+        backend.qcom_texture_block_match2_supported,
+        backend.qcom_max_block_match_window.width,
+        backend.qcom_max_block_match_window.height,
+        backend.qcom_image_processing3_advertised,
+        backend.qcom_cubic_weights_advertised,
+        backend.qcom_selectable_cubic_weights_supported,
+        backend.qcom_cubic_clamp_advertised,
+        backend.qcom_cubic_range_clamp_supported, format_summary);
+  }
   return device;
 }
 
@@ -1368,6 +2132,30 @@ void VulkanDevice::LogFaultInfo() {
     XELOGE("  vendor code: {} fault=0x{:016X} \"{}\"", v.vendorFaultCode,
            v.vendorFaultData, v.description);
   }
+}
+
+std::optional<uint32_t> VulkanDevice::QueryGpuBusyPermille() const {
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  // Adreno only: KGSL's busy and total time over its last update period.
+  if (properties_.vendorID != 0x5143) {
+    return std::nullopt;
+  }
+  std::FILE* file = std::fopen("/sys/class/kgsl/kgsl-3d0/gpubusy", "r");
+  if (!file) {
+    return std::nullopt;
+  }
+  unsigned long long busy = 0;
+  unsigned long long total = 0;
+  const int fields = std::fscanf(file, "%llu %llu", &busy, &total);
+  std::fclose(file);
+  if (fields != 2) {
+    return std::nullopt;
+  }
+  // 0 0 while the GPU is powered down: idle, not unavailable.
+  return total ? uint32_t(std::min(busy, total) * 1000 / total) : 0u;
+#else
+  return std::nullopt;
+#endif
 }
 
 }  // namespace vulkan

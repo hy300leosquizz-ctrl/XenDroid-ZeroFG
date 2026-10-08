@@ -13,6 +13,9 @@ import androidx.core.content.getSystemService
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import xendroid.compose.core.EmulatorRuntime
+import xendroid.compose.core.ContentPaths
+import java.io.File
+import xendroid.compose.core.GameMetadataSource
 import xendroid.compose.core.ProfileBootstrap
 import xendroid.compose.data.Game
 import xendroid.compose.data.GameFormat
@@ -132,6 +135,23 @@ class GameLibraryViewModel(
     fun clearTitleIdRequest() { _titleId.value = TitleIdState.Idle }
 
     /** Build the launch Intent that the host Activity resolves. Caller startActivity()s it. */
+    /** Packages [game]'s disc carries that are not installed yet, i.e. the payload a
+     *  mandatory-install title (GTA V and friends) needs on the HDD before it will run.
+     *  Empty for an ordinary disc, or once its content is installed. Off-main: walks the
+     *  disc image. */
+    suspend fun uninstalledDiscContent(game: Game): List<GameMetadataSource.DiscContent> =
+        withContext(Dispatchers.IO) {
+            if (game.format != GameFormat.ISO && game.format != GameFormat.ZAR) {
+                return@withContext emptyList()
+            }
+            EmulatorRuntime.ensureLoaded()
+            GameMetadataSource().listDiscContent(game.launchUri).filterNot { item ->
+                val titleId = item.titleId ?: return@filterNot false
+                File(ContentPaths.contentDir(titleId, item.contentType), item.displayName)
+                    .exists()
+            }
+        }
+
     fun buildLaunchIntent(game: Game): Intent =
         Intent(ACTION_LAUNCH_GAME).apply {
             setPackage(appContext.packageName)          // self; host is in this app

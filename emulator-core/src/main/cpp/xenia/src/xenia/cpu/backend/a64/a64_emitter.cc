@@ -99,6 +99,9 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
   trace_data_ = &function->trace_data();
 
   current_guest_function_ = function->address();
+  log_guest_call_ = !cvars::log_guest_calls_at.empty() &&
+                    GuestAddressInList(cvars::log_guest_calls_at,
+                                       current_guest_function_);
 
   // Reset state.
   stack_size_ = StackLayout::GUEST_STACK_SIZE;
@@ -200,6 +203,10 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
     mov(x1, static_cast<uint64_t>(current_guest_function_));
     CallNative(reinterpret_cast<void*>(TraceFunctionEntry));
   }
+  if (log_guest_call_) {
+    mov(x1, static_cast<uint64_t>(current_guest_function_));
+    CallNative(reinterpret_cast<void*>(LogGuestCallEntry));
+  }
 
   // Allocate the epilog label (owned by label_cache_ for cleanup).
   auto epilog_label_ptr = new Label();
@@ -269,6 +276,10 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info) {
   if (IsTracingFunc()) {
     mov(x1, static_cast<uint64_t>(current_guest_function_));
     CallNative(reinterpret_cast<void*>(TraceFunctionReturn));
+  }
+  if (log_guest_call_) {
+    mov(x1, static_cast<uint64_t>(current_guest_function_));
+    CallNative(reinterpret_cast<void*>(LogGuestCallReturn));
   }
   code_offsets.epilog = getSize();
 

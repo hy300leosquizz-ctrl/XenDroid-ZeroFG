@@ -1,6 +1,9 @@
 add_library(xenia-ui-vulkan STATIC)
 xe_platform_sources(xenia-ui-vulkan ${CMAKE_CURRENT_SOURCE_DIR})
 xe_platform_sources(xenia-ui-vulkan ${CMAKE_CURRENT_SOURCE_DIR}/functions)
+target_sources(xenia-ui-vulkan PRIVATE
+  ${PROJECT_SOURCE_DIR}/../zerofg/integration/xenia/zerofg_xenia_adapter.cc
+)
 # XenDroid (Android): skip shader regeneration on Android (see gpu/vulkan/CMakeLists.txt).
 if(NOT ANDROID)
   xe_shader_rules_spirv(xenia-ui-vulkan ${CMAKE_CURRENT_SOURCE_DIR}/../shaders)
@@ -8,15 +11,13 @@ if(NOT ANDROID)
                         TARGET spirv)
 endif()
 target_include_directories(xenia-ui-vulkan PRIVATE
+  ${PROJECT_SOURCE_DIR}/..
   ${PROJECT_SOURCE_DIR}/third_party/Vulkan-Headers/include
   ${PROJECT_SOURCE_DIR}/third_party/glslang
 )
 target_link_libraries(xenia-ui-vulkan
-  PUBLIC
-    xenia-base
-    xenia-ui
-  PRIVATE
-    zerofg
+  PUBLIC xenia-base xenia-ui
+  PRIVATE zerofg
 )
 if(APPLE)
   target_link_libraries(xenia-ui-vulkan PUBLIC MoltenVK)

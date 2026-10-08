@@ -219,6 +219,12 @@ class GameLibraryRepository(
             return Game(path, hit.name, fmt, hit.iconCacheName, hit.titleId, hit.mediaId,
                         hit.discNumber, hit.discCount)
         }
+        // The type gate runs before the GOD probe, not just in the STFS branch below: add-on
+        // content (DLC, title updates, profiles, saves) is an STFS container too, so the GOD
+        // reader parses it happily and would publish it as a game. An unreadable header is not
+        // a rejection - it only means the type is unknown, so those still fall through.
+        val header = metadata.readContentHeader(path)
+        if (header != null && !ContentPaths.isLaunchableGameType(header.contentType)) return null
         metadata.readGodPath(path)?.let { meta ->
             val displayName = meta.name.ifEmpty { name }
             val iconName = meta.iconPng?.let { iconCache.write(path, it) }
@@ -227,10 +233,8 @@ class GameLibraryRepository(
             return Game(path, displayName, GameFormat.GOD, iconName, meta.titleId, meta.mediaId,
                         meta.discNumber, meta.discCount)
         }
-        // GOD MUST be probed first (above): a GOD container also parses as a content package,
-        // so reaching here only after readGodPath fails keeps GOD out of this STFS branch.
-        val header = metadata.readContentHeader(path) ?: return null
-        if (!ContentPaths.isLaunchableGameType(header.contentType)) return null  // add-on content, not a game
+        // GOD is probed first (above) because a GOD container also parses as a content package.
+        if (header == null) return null
         val displayName = header.displayName.ifBlank { name }
         val iconName = header.iconPng?.let { iconCache.write(path, it) }
         metadataCache.put(path, displayName, iconName, signatureOf(child), header.titleId, null, GameFormat.STFS)

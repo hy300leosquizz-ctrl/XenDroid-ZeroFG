@@ -13,21 +13,33 @@ class SettingsSchemaTest {
 
     private val all = SettingsSchema.allSettings
 
-    // 98 Bool + 12 IntRange + 21 ListChoice + 2 Action = 133. Display|host_present_from_non_ui_thread
-    // is intentionally absent (forced true natively; not a valid user choice).
-    @Test fun total_entry_count_is_133() {
-        assertEquals(133, all.size)
+    // Expected inventory of the 1.0 release: 101 Bool + 12 IntRange + 22 ListChoice + 2 Action = 137.
+    // GPU|readback_resolve and APU|xma_decoder are string cvars (fast/some/full/none and the
+    // decoder name), hence ListChoice rather than Bool.
+    @Test fun total_entry_count_is_137() {
+        assertEquals(137, all.size)
         assertEquals(
-            133,
+            137,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action },
         )
     }
 
+    /** The native writer stores a decimal-looking value as a TOML double, and a string
+     *  cvar then silently keeps its default: that voided the 2026-09-26 Grid spread
+     *  sweep. Numeric list settings must use integer values backed by int cvars. */
+    @Test fun no_list_option_is_retyped_to_a_double_by_the_native_writer() {
+        val retyped = all.filterIsInstance<Setting.ListChoice>().flatMap { s ->
+            s.options.filter { ConfigValueShape.nativeStoresAsDouble(it.value) }
+                .map { "${s.key}=${it.value}" }
+        }
+        assertEquals(emptyList<String>(), retyped)
+    }
+
     @Test fun counts_by_type_match_verified_inventory() {
-        assertEquals(98, all.count { it is Setting.Bool })
+        assertEquals(101, all.count { it is Setting.Bool })
         assertEquals(12, all.count { it is Setting.IntRange })
-        assertEquals(21, all.count { it is Setting.ListChoice })
+        assertEquals(22, all.count { it is Setting.ListChoice })
         assertEquals(2, all.count { it is Setting.Action })
     }
 
@@ -49,9 +61,50 @@ class SettingsSchemaTest {
         assertEquals(all.size, all.map { it.key }.toSet().size)
     }
 
+    /** The GPU guard (the output shaper) left the 1.0 release: tuned for the FIFO egress, it
+     *  stacked on the vsync quantizer's lead and made a saturated game stutter more. */
+    @Test fun gpu_guard_is_not_in_the_release() {
+        assertNull(SettingsSchema.byKey["Vulkan|zerofg_gpu_guard"])
+    }
+
+    /** The MSA experiments answered their questions and left the code. */
+    @Test fun concluded_msa_experiments_stay_removed() {
+        listOf(
+            "zerofg_msa_force_present_all",
+            "zerofg_display_vote_60",
+            "zerofg_msa_output_shaper_60",
+        ).forEach { key -> assertNull(SettingsSchema.byKey["Vulkan|$key"]) }
+    }
+
+    /** Cleanup L1: these switches became the code and must not come back as toggles. */
+    @Test fun consolidated_split_switches_stay_removed() {
+        listOf(
+            "zerofg_split_production_frontier",
+            "zerofg_split_source_progress",
+            "zerofg_split_transition_evidence",
+            "zerofg_split_lattice_compaction",
+            "zerofg_better_d",
+            "zerofg_split_finalready_completion_judgement",
+            "zerofg_split_source_bp_mutex_subtraction",
+            "zerofg_split_rate_probe_bounds",
+            "zerofg_split_real_only_regime_validation",
+            "zerofg_split_transition_planned_space",
+            "zerofg_split_freshness_drain",
+            "zerofg_host_refresh_request",
+            "zerofg_surface_buffer_backpressure",
+            "zerofg_main_surface_authority",
+            "zerofg_separate_presenter_device",
+            "zerofg_q0_lineage_telemetry",
+        ).forEach { key -> assertNull(SettingsSchema.byKey["Vulkan|$key"]) }
+    }
+
+    // ZeroFG comes first: it gathers our own controls, including the ones that
+    // used to sit in Display. A category is UI grouping only - the stored key
+    // stays "$section|$name", so moving an entry loses no persisted value.
     @Test fun categories_present_in_legacy_order() {
         val expected = listOf(
-            "Vulkan", "Video", "UI", "Storage", "Kernel", "HID", "Memory", "XConfig",
+            "ZeroFG",
+            "Vulkan", "Video", "UI", "Storage", "Kernel", "Controller", "HID", "Memory", "XConfig",
             "Display", "GPU", "CPU", "Logging", "Content", "General", "APU",
         )
         assertEquals(expected, SettingsSchema.categories.map { it.title })
@@ -59,6 +112,37 @@ class SettingsSchemaTest {
 
     @Test fun removed_no_op_settings_stay_removed() {
         assertNull(SettingsSchema.byKey["Kernel|Allow_nui_initialization"])
+    }
+
+    @Test fun zerofg_exposes_off_zero_and_reallyzero() {
+        val zerofg = SettingsSchema.categories.single { it.title == "ZeroFG" }
+        val setting = zerofg.settings.single { it.name == "zerofg_mode" }
+        assertEquals("Vulkan|zerofg_mode", setting.key)
+        assertTrue(setting is Setting.ListChoice)
+        setting as Setting.ListChoice
+        assertEquals("off", setting.default)
+        assertEquals(listOf("off", "zero", "reallyzero"), setting.options.map { it.value })
+        assertTrue(setting.desc.isNotBlank())
+    }
+
+    @Test fun zerofg_exposes_the_product_controls_only() {
+        val zerofg = SettingsSchema.categories.single { it.title == "ZeroFG" }
+        assertEquals(listOf("zerofg_mode"), zerofg.settings.map { it.name })
+        // Development switches, variants and diagnostics stay out of the release.
+        listOf(
+            "zerofg_rc1_test_backend",
+            "zerofg_rc1_test_round",
+            "zerofg_rc1_test_pipeline_stats",
+            "zerofg_rc1_test_f2_pass",
+            "zerofg_rc1_test_debug_view",
+            "zerofg_rc1_test_counters",
+            "zerofg_gpu_apocalypse_guard",
+            "zerofg_free_output",
+            "zerofg_vsync_quantizer",
+            "vulkan_completion_wait_telemetry",
+            "vulkan_two_frames_in_flight",
+        ).forEach { retired -> assertNull(SettingsSchema.byKey["Vulkan|$retired"]) }
+        assertNull(SettingsSchema.byKey["GPU|log_gpu_frame_time_breakdown"])
     }
 
     @Test fun actions_are_the_driver_picker_and_the_log_export() {

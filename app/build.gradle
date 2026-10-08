@@ -26,12 +26,15 @@ android {
     ndkVersion '29.0.14206865'
 
     defaultConfig {
-        applicationId 'xendroid.compose'
+        // XenDroid-ZeroFG is its own app, signed with its own key: it installs next
+        // to XenDroid (xendroid.compose). The namespace stays xendroid.compose.
+        applicationId 'xendroid.zerofg'
         // 29+ matches :emulator-core (native ELF TLS in libe.so).
         minSdk 29
         targetSdk 35
-        versionCode 1
-        versionName project.findProperty("gitHash") ?: "unknown"
+        // ZeroFG 1.0. CI appends the commit hash.
+        versionCode 100
+        versionName "1.0.0" + (project.findProperty("gitHash") ? "-" + project.findProperty("gitHash") : "")
         
     }
 

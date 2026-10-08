@@ -34,6 +34,7 @@ toml::parse_result ParseFile(const std::filesystem::path& filename) {
 
 CmdVar(config, "", "Specifies the target config to load.");
 
+
 DEFINE_uint32(
     defaults_date, 0,
     "Do not modify - internal version of the default values in the config, for "
@@ -264,7 +265,8 @@ void ReadConfig(const std::filesystem::path& file_path,
   XELOGI("Loaded config: {}", file_path);
 }
 
-uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
+static uint32_t LoadGameConfigForFileImpl(
+    const std::filesystem::path& game_path) {
   if (game_path.empty() || !std::filesystem::exists(game_path)) {
     return 0;
   }
@@ -361,6 +363,10 @@ uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
   }
 
   return title_id;
+}
+
+uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
+  return LoadGameConfigForFileImpl(game_path);
 }
 
 void SaveGameConfig(uint32_t title_id, const toml::table& config_table) {

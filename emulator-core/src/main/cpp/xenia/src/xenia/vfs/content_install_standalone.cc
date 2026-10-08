@@ -15,6 +15,7 @@
 #include "xenia/base/string.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/xam/content_manager.h"
+#include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
 #include "xenia/vfs/virtual_file_system.h"
 #include "xenia/xbox.h"
@@ -111,6 +112,157 @@ X_STATUS InstallContentPackageStandalone(
     std::error_code cleanup_ec;
     std::filesystem::remove_all(data_path, cleanup_ec);
   }
+  return status;
+}
+
+namespace {
+
+// Mounts a disc image read-only for the content walk. Null when the image is not
+// a readable disc.
+std::unique_ptr<DiscImageDevice> OpenDisc(
+    const std::filesystem::path& disc_path) {
+  auto device = std::make_unique<DiscImageDevice>("", disc_path);
+  if (!device->Initialize()) {
+    XELOGE("Disc content: not a readable disc image: {}", disc_path.string());
+    return nullptr;
+  }
+  return device;
+}
+
+bool IsDirectory(const Entry* entry) {
+  return (entry->attributes() & kFileAttributeDirectory) != 0;
+}
+
+}  // namespace
+
+std::vector<DiscContentItem> ListDiscContent(
+    const std::filesystem::path& disc_path) {
+  std::vector<DiscContentItem> items;
+  std::unique_ptr<DiscImageDevice> device = OpenDisc(disc_path);
+  if (!device) {
+    return items;
+  }
+  Entry* content_root = device->ResolvePath("content");
+  if (!content_root || !IsDirectory(content_root)) {
+    return items;
+  }
+  // \content\<XUID>\<TitleID>\<Type>\<package>. The tree encodes the title id
+  // and content type, so no package header has to be parsed to enumerate; the
+  // installer re-derives both from the container itself, authoritatively.
+  for (const auto& xuid_dir : content_root->children()) {
+    if (!IsDirectory(xuid_dir.get())) continue;
+    for (const auto& title_dir : xuid_dir->children()) {
+      if (!IsDirectory(title_dir.get())) continue;
+      uint32_t title_id = 0;
+      if (std::sscanf(title_dir->name().c_str(), "%8x", &title_id) != 1) {
+        continue;
+      }
+      for (const auto& type_dir : title_dir->children()) {
+        if (!IsDirectory(type_dir.get())) continue;
+        uint32_t content_type = 0;
+        if (std::sscanf(type_dir->name().c_str(), "%8x", &content_type) != 1) {
+          continue;
+        }
+        for (const auto& package : type_dir->children()) {
+          if (IsDirectory(package.get())) continue;
+          DiscContentItem item;
+          item.inner_path =
+              fmt::format("content\\{}\\{}\\{}\\{}", xuid_dir->name(),
+                          title_dir->name(), type_dir->name(), package->name());
+          item.display_name = package->name();
+          item.title_id = title_id;
+          item.content_type = content_type;
+          item.size = package->size();
+          items.push_back(std::move(item));
+        }
+      }
+    }
+  }
+  XELOGI("Disc content: {} package(s) on {}", items.size(), disc_path.string());
+  return items;
+}
+
+X_STATUS InstallDiscContentPackage(const std::filesystem::path& disc_path,
+                                   const std::string& inner_path,
+                                   const std::filesystem::path& content_root,
+                                   const std::filesystem::path& scratch_dir,
+                                   ContentProgress& progress) {
+  progress.current.store(0);
+  progress.total.store(0);
+
+  std::unique_ptr<DiscImageDevice> device = OpenDisc(disc_path);
+  if (!device) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  Entry* entry = device->ResolvePath(inner_path);
+  if (!entry || IsDirectory(entry)) {
+    XELOGE("Disc content: no package at {} on {}", inner_path,
+           disc_path.string());
+    return X_STATUS_OBJECT_NAME_NOT_FOUND;
+  }
+
+  // The container device reads a host file (fopen + file_size), so the package
+  // is staged out of the image before it can be installed. Staging is counted
+  // as the first half of the payload so the progress bar keeps moving through
+  // what is otherwise a long silent copy.
+  const uint64_t package_size = entry->size();
+  progress.total.store(package_size * 2);
+
+  std::error_code ec;
+  std::filesystem::create_directories(scratch_dir, ec);
+  const auto space = std::filesystem::space(scratch_dir, ec);
+  if (!ec && space.available < package_size * 1.1f) {
+    XELOGE("Disc content: not enough space to stage {} ({} bytes)", inner_path,
+           package_size);
+    return X_STATUS_DISK_FULL;
+  }
+
+  const std::filesystem::path staged = scratch_dir / entry->name();
+  X_STATUS status = X_STATUS_SUCCESS;
+  {
+    vfs::File* in_file = nullptr;
+    status = entry->Open(FileAccess::kFileReadData, &in_file);
+    if (status != X_STATUS_SUCCESS) {
+      return status;
+    }
+    FILE* out_file = xe::filesystem::OpenFile(staged, "wb");
+    if (!out_file) {
+      in_file->Destroy();
+      return X_STATUS_ACCESS_DENIED;
+    }
+    constexpr size_t kChunkSize = 4 * 1024 * 1024;
+    std::vector<uint8_t> buffer(kChunkSize);
+    size_t offset = 0;
+    while (offset < package_size) {
+      size_t bytes_read = 0;
+      status = in_file->ReadSync(std::span<uint8_t>(buffer), offset,
+                                 &bytes_read);
+      if (status != X_STATUS_SUCCESS || !bytes_read) {
+        status = status != X_STATUS_SUCCESS ? status : X_STATUS_END_OF_FILE;
+        break;
+      }
+      if (std::fwrite(buffer.data(), 1, bytes_read, out_file) != bytes_read) {
+        status = X_STATUS_DISK_FULL;
+        break;
+      }
+      offset += bytes_read;
+      progress.current.store(offset);
+    }
+    std::fclose(out_file);
+    in_file->Destroy();
+  }
+
+  if (status == X_STATUS_SUCCESS) {
+    // The staged copy is now an ordinary package; the shared installer parses
+    // its header and places it by content type. It resets progress, so the
+    // staging half is spent by this point.
+    status = InstallContentPackageStandalone(staged, content_root, progress);
+  } else {
+    XELOGE("Disc content: staging {} failed 0x{:08X}", inner_path, status);
+  }
+
+  std::error_code cleanup_ec;
+  std::filesystem::remove(staged, cleanup_ec);
   return status;
 }
 
