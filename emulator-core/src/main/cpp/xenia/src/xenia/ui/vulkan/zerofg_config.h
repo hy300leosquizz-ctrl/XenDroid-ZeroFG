@@ -1,12 +1,14 @@
 #ifndef XENIA_UI_VULKAN_ZEROFG_CONFIG_H_
 #define XENIA_UI_VULKAN_ZEROFG_CONFIG_H_
 
+#include <atomic>
 #include <cstdint>
 
 #include "xenia/base/cvar.h"
 
 DECLARE_bool(zerofg_frame_generation);
 DECLARE_string(zerofg_mode);
+DECLARE_uint32(zerofg_fps_limit);
 
 namespace xe::ui::vulkan {
 
@@ -35,6 +37,15 @@ inline ZeroFGSelection GetZeroFGSelection() {
 
 inline bool IsZeroFGRequested() {
   return GetZeroFGSelection() != ZeroFGSelection::kOff;
+}
+
+// True while a ZeroFG presenter is connected and has not failed open. The
+// guest-side pacing (the vblank pull and the game frame rate cap) acts only
+// then: a session that fell back to the native path, or whose device B never
+// qualified, runs the guest natively.
+inline std::atomic<bool>& ZeroFGGuestPacingLive() {
+  static std::atomic<bool> live{false};
+  return live;
 }
 
 inline bool IsReallyZeroRequested() {

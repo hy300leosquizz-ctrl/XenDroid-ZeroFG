@@ -143,6 +143,28 @@ class PresenterSampleWindow {
     return sum / count_;
   }
 
+  // The mean without the window's largest and smallest value (with fewer than
+  // three values, the plain mean): one outlier moves nothing.
+  uint64_t MeanWithoutExtremes() const {
+    if (count_ < 3) {
+      return Mean();
+    }
+    uint64_t sum = 0;
+    uint64_t smallest = std::numeric_limits<uint64_t>::max();
+    uint64_t largest = 0;
+    for (size_t i = 0; i < count_; ++i) {
+      sum = values_[i] > std::numeric_limits<uint64_t>::max() - sum
+                ? std::numeric_limits<uint64_t>::max()
+                : sum + values_[i];
+      smallest = std::min(smallest, values_[i]);
+      largest = std::max(largest, values_[i]);
+    }
+    if (sum == std::numeric_limits<uint64_t>::max()) {
+      return sum;
+    }
+    return (sum - smallest - largest) / (count_ - 2);
+  }
+
   uint64_t Quantile(uint32_t numerator, uint32_t denominator) const {
     if (!count_) {
       return 0;
@@ -3462,6 +3484,9 @@ struct ZeroFGIndependentPresenter::Impl {
     h1c_episode_chains_at_drain_start = 0;
     h1c_fast_sequence_start_total = 0;
     h1c_transition_real_only_pair_total = 0;
+    rate_lock_own_interval_ns = {};
+    rate_lock_excess_ns = 0;
+    reanchor_cutover_moved_total = 0;
     h1c_false_positive_pair_total = 0;
     h1c_post_confirm_quarantine_total = 0;
     h1c_drain_complete_total = 0;
@@ -4107,6 +4132,7 @@ struct ZeroFGIndependentPresenter::Impl {
     detach_requested.store(false, std::memory_order_release);
     surface_connected = true;
     vulkan_device->BeginZeroFGSurface();
+    SetGuestPacingLive(true, "connected");
     XELOGI(
         "ZeroFGDeviceDomain source=A:0 presenter=B:0 "
         "owners=ingress_context,residency_slot,generation_context,post_slot "
@@ -4135,8 +4161,19 @@ struct ZeroFGIndependentPresenter::Impl {
     // long enough to drain already-accepted work.
     source_activation_armed.store(false, std::memory_order_release);
     accepting.store(false, std::memory_order_release);
+    SetGuestPacingLive(false, "disconnect");
     std::shared_ptr<EventBridge> local_bridge = bridge;
     SignalPresenterWake(local_bridge, true);
+  }
+
+  // The guest-side pacing (the vblank pull and the game frame rate cap) acts
+  // on the guest only while this is set (CommandProcessor::GuestPacingLive):
+  // connected and not failed open, so a fallback to the native path is native.
+  static void SetGuestPacingLive(bool live, const char* reason) {
+    if (ZeroFGGuestPacingLive().exchange(live, std::memory_order_acq_rel) !=
+        live) {
+      XELOGI("ZeroFGGuestPacing live={} reason={}", live, reason);
+    }
   }
 
   void DestroySurfaceResourcesAfterSourceIdle() {
@@ -4226,6 +4263,7 @@ struct ZeroFGIndependentPresenter::Impl {
       DestroyResidencySlot(slot);
     }
     surface_connected = false;
+    SetGuestPacingLive(false, "destroyed");
     final_output_authority.store(false, std::memory_order_release);
     extent = {};
     final_output_format = VK_FORMAT_UNDEFINED;
@@ -4962,6 +5000,7 @@ struct ZeroFGIndependentPresenter::Impl {
     accepting.store(false, std::memory_order_release);
     detach_requested.store(true, std::memory_order_release);
     terminal_reason.store(reason, std::memory_order_release);
+    SetGuestPacingLive(false, TerminalReasonName(reason));
     ++fail_open_total;
     bool expected = false;
     if (terminal_logged.compare_exchange_strong(
@@ -7664,6 +7703,23 @@ struct ZeroFGIndependentPresenter::Impl {
       const bool post_bp_clean = !bp_wait && source_issue_previous_bp;
       const bool censor_period = bp_wait || post_bp_clean;
       source_issue_previous_bp = bp_wait != 0;
+      // The rate lock learns from every interval, censored or not: what the
+      // Source took by itself, without the wait ZeroFG imposed in it. With
+      // two frames in flight the Source may have its next frame nearly done
+      // while it waits, so that difference understates its period: a sample
+      // with a wait in it pulls at most a fifth below the window.
+      uint64_t own_interval_ns = std::clamp<uint64_t>(
+          interval > bp_wait ? interval - bp_wait : 0,
+          kSourcePeriodMinimumPlausibleNs, kSourcePeriodMaximumPlausibleNs);
+      if (bp_wait) {
+        const uint64_t window_ns =
+            rate_lock_own_interval_ns.MeanWithoutExtremes();
+        const uint64_t bound_ns = window_ns - window_ns / 5;
+        if (window_ns && own_interval_ns < bound_ns) {
+          own_interval_ns = bound_ns;
+        }
+      }
+      rate_lock_own_interval_ns.Add(own_interval_ns);
       ObserveH1cFastSequenceEvidence(sequence, interval, bp_wait,
                                      censor_period);
       RememberPlannedSpaceFastEvidence(sequence, interval, bp_wait,
@@ -10100,6 +10156,13 @@ struct ZeroFGIndependentPresenter::Impl {
     const uint64_t b_issue_ns = logical.candidate.issue_time_ns;
     const uint64_t ab_ns =
         a_issue_ns && b_issue_ns > a_issue_ns ? b_issue_ns - a_issue_ns : 0;
+    // A -> B is late against the rate lock's own period while it is locked:
+    // the regime P can stay where it last clustered and then censors the
+    // slower pairs of a 33/50 mix as late, so D would learn from the fast
+    // ones.
+    const uint64_t late_period_ns =
+        RateLockPeriodNs() ? rate_lock_own_interval_ns.MeanWithoutExtremes()
+                           : source_period_ns;
     BetterDCensor reason = BetterDCensor::kCount;
     if (!stable_latency_metronome_armed || !stable_output_quantum_ns) {
       reason = BetterDCensor::kUnarmed;
@@ -10112,9 +10175,8 @@ struct ZeroFGIndependentPresenter::Impl {
     } else if (logical.semantic_forward_skipped ||
                logical.synthetic_presentation_retired) {
       reason = BetterDCensor::kSkippedOrRetired;
-    } else if (source_period_ns &&
-               ab_ns > SaturatingAddNs(source_period_ns,
-                                       source_period_ns / 2)) {
+    } else if (late_period_ns &&
+               ab_ns > SaturatingAddNs(late_period_ns, late_period_ns / 2)) {
       reason = BetterDCensor::kSourceLate;
       better_d_source_late_ab_ns.Add(ab_ns);
     } else if (logical.in_production_during_saturation) {
@@ -10128,8 +10190,13 @@ struct ZeroFGIndependentPresenter::Impl {
     }
     SyncBetterDEpoch();
     // D_need_i = C_pair_clean_i - S_offset + dispatch_lead. A consecutive
-    // pair at 2x places S one output quantum after A.
-    const uint64_t s_offset_ns = stable_output_quantum_ns;
+    // pair at 2x places S one output quantum after A: A's quantum, the one
+    // the pair was placed with (a rate-lock reanchor may have changed the
+    // global quantum since, inside the window).
+    const uint64_t pair_quantum_ns =
+        logical.candidate.semantic_output_quantum_ns;
+    const uint64_t s_offset_ns =
+        pair_quantum_ns ? pair_quantum_ns : stable_output_quantum_ns;
     const uint64_t lead_ns =
         logical.dispatch_lead_ns ? logical.dispatch_lead_ns : dispatch_lead_ns;
     const uint64_t need_ns = SaturatingAddNs(
@@ -10265,6 +10332,61 @@ struct ZeroFGIndependentPresenter::Impl {
            source_period_samples_ns.count() >= kSourcePhaseStableSamples &&
            SourcePeriodWindowClustered(source_period_samples_ns, 20) &&
            !source_transition_samples_ns.count() && IsStablePacingState();
+  }
+
+  // The rate lock: the period the output lattice follows, 0 while it is not
+  // active (not enough intervals yet, or §7 owns the operating point).
+  //
+  // The regime estimate (ObserveSourcePeriod) learns only from clean
+  // intervals and moves only when a window clusters within 5 % (inside the
+  // 20 % band) or four samples within 10 % (across it). A game on a 60 Hz
+  // guest vsync that takes two or three vblanks per frame (33/50 ms in a
+  // drifting mix) never clusters, and under backpressure every interval is
+  // censored, so P stayed wherever it last caught a cluster: above the game's
+  // rate the pools filled and the Source waited (~450 ms wells in Arkham),
+  // below it R and S went out back to back.
+  //
+  // The lock follows the trimmed mean of the last kRateLockWindow intervals,
+  // each without the backpressure wait ZeroFG imposed in it, so it is
+  // measured while we pace the Source and one hitch moves nothing. While the
+  // last committed Real sits more than one quantum deeper than Better D
+  // operates at, the lattice runs faster than the game: a tenth of the excess
+  // per period, at most a fifth. The well drains through the rate; nothing is
+  // skipped, and live commitments are never retargeted (future-only
+  // reanchors, as for any frequency confirmation).
+  uint64_t RateLockPeriodNs() const {
+    if (physical_op_confirmed ||
+        rate_lock_own_interval_ns.count() < kRateLockWindow) {
+      return 0;
+    }
+    const uint64_t own_period_ns =
+        rate_lock_own_interval_ns.MeanWithoutExtremes();
+    const uint64_t band_ns = stable_output_quantum_ns;
+    if (!own_period_ns || !band_ns || rate_lock_excess_ns <= int64_t(band_ns)) {
+      return own_period_ns;
+    }
+    const uint64_t excess_ns = uint64_t(rate_lock_excess_ns) - band_ns;
+    const uint64_t correction_ns =
+        std::min(excess_ns / kRateLockGainDivisor,
+                 own_period_ns / kRateLockMaxCorrectionDivisor);
+    return own_period_ns - correction_ns;
+  }
+
+  // The period the lattice follows: the rate lock's, or the regime P.
+  uint64_t LatticePeriodNs() const {
+    const uint64_t locked_ns = RateLockPeriodNs();
+    return locked_ns ? locked_ns : source_period_ns;
+  }
+
+  // The gate of the lattice's frequency confirmation and of its reanchor.
+  // Under the rate lock the regime window's clustering is not required: a
+  // game that never clusters is exactly the one the lock must follow.
+  bool LatticePhaseWindowStable() const {
+    if (!RateLockPeriodNs()) {
+      return SourcePhaseWindowStable();
+    }
+    return source_period_ns && accepting.load(std::memory_order_acquire) &&
+           !detach_requested.load(std::memory_order_acquire);
   }
 
   static const char* SourceReanchorReasonName(SourceReanchorRequestReason reason) {
@@ -10447,8 +10569,10 @@ struct ZeroFGIndependentPresenter::Impl {
   }
 
   void ObservePhaseDebt(uint64_t interval_ns) {
-    if (!stable_latency_metronome_armed || !stable_output_quantum_ns ||
-        !source_period_ns ||
+    // The rate lock owns the lattice's phase: it runs the lattice faster than
+    // the Source on purpose while it drains, which Phase Debt would undo.
+    if (RateLockPeriodNs() || !stable_latency_metronome_armed ||
+        !stable_output_quantum_ns || !source_period_ns ||
         !source_effective_rate_timestamps_ns.EffectiveRateStable(
             kSourceEffectiveRateToleranceDivisor) ||
         source_transition_samples_ns.count()) {
@@ -10510,10 +10634,12 @@ struct ZeroFGIndependentPresenter::Impl {
       return;
     }
 
+    // The period the lattice must follow: the regime P, or the rate lock's.
+    const uint64_t lattice_period_ns = LatticePeriodNs();
     const uint64_t epoch_pair_period_ns =
         SaturatingMultiplyNs(stable_output_quantum_ns, 2);
     const int64_t period_error_ns =
-        PresenterSignedDeltaNs(epoch_pair_period_ns, source_period_ns);
+        PresenterSignedDeltaNs(epoch_pair_period_ns, lattice_period_ns);
     const int64_t phase_error_ns =
         PresenterSignedDeltaNs(next_semantic_target_ns, source_anchor_ns);
     const int64_t previous_phase_error_ns = source_phase_previous_error_ns;
@@ -10560,14 +10686,20 @@ struct ZeroFGIndependentPresenter::Impl {
     source_phase_previous_error_ns = phase_error_ns;
     source_phase_previous_valid = true;
 
-    if (!SourcePhaseWindowStable()) {
+    if (!LatticePhaseWindowStable()) {
       ClearSourcePhaseConfirmation();
       return;
     }
     ++source_phase_stable_source_sample_total;
 
+    // Under the rate lock, a lattice within kRateLockDeadbandPercent of its
+    // period is left alone: reanchors were tied to S HOLDs and late outputs
+    // (r = +0.5..+0.65 per window with the frame rate held fixed).
     const uint64_t minimum_frequency_error_ns = std::max<uint64_t>(
-        kSourcePhaseMinimumFrequencyErrorNs, source_period_ns / 1000);
+        kSourcePhaseMinimumFrequencyErrorNs,
+        RateLockPeriodNs()
+            ? lattice_period_ns * kRateLockDeadbandPercent / 100
+            : lattice_period_ns / 1000);
     const uint64_t period_error_magnitude_ns =
         SignedMagnitudeNs(period_error_ns);
     if (!period_error_ns ||
@@ -10627,7 +10759,7 @@ struct ZeroFGIndependentPresenter::Impl {
         kSourcePhaseMinimumConfirmPeriods,
         kSourcePhaseMaximumConfirmPeriods);
     const uint64_t confirmation_time_ns =
-        SaturatingMultiplyNs(source_period_ns, confirmation_periods);
+        SaturatingMultiplyNs(lattice_period_ns, confirmation_periods);
     const uint64_t accumulated_frequency_error_ns =
         source_phase_confirmation_frequency_accumulated_ns;
     const bool normal_confirmation =
@@ -10638,7 +10770,7 @@ struct ZeroFGIndependentPresenter::Impl {
         source_phase_confirmation_samples >=
             kSourcePhaseUrgentConfirmSamples;
     if (normal_confirmation || urgent_confirmation) {
-      RequestSourceReanchor(source_period_ns,
+      RequestSourceReanchor(lattice_period_ns,
                             SourceReanchorRequestReason::kFrequencyConfirmation);
       if (period_error_ns > 0) {
         ++source_phase_reanchor_faster_source_request_total;
@@ -10652,12 +10784,13 @@ struct ZeroFGIndependentPresenter::Impl {
                                        uint64_t source_anchor_ns,
                                        uint64_t safe_future_anchor_ns,
                                        bool confirmed_slower_transition =
-                                           false) {
+                                           false,
+                                       uint64_t cutover_floor_ns = 0) {
     const uint64_t requested_source_period_ns =
         pending_source_reanchor_period_ns ? pending_source_reanchor_period_ns
                                           : source_period_ns;
     if (!source_phase_reanchor_pending ||
-        (!confirmed_slower_transition && !SourcePhaseWindowStable()) ||
+        (!confirmed_slower_transition && !LatticePhaseWindowStable()) ||
         !issue_ns || !source_anchor_ns || !safe_future_anchor_ns ||
         !stable_output_quantum_ns || !requested_source_period_ns) {
       return false;
@@ -10717,6 +10850,19 @@ struct ZeroFGIndependentPresenter::Impl {
     if (!first_target_ns ||
         first_target_ns == std::numeric_limits<uint64_t>::max()) {
       return false;
+    }
+    // The reanchor cutover. The first Real committed in the new epoch keeps
+    // its predecessor and S(A->B) in the old epoch, so its causal floor is its
+    // pair boundary (cutover_floor_ns, ReanchorCutoverFloorNs). A first tick
+    // placed before that floor is a slot nothing can fill: the Real takes the
+    // first tick at or after its floor and the empty ticks before it count as
+    // implicit HOLDs. Starting the epoch at the floor removes only those
+    // slots. A, S and every live commitment keep their targets, no floor is
+    // lowered, and the start only moves later, so it stays past the issue,
+    // live and ordered floors.
+    if (cutover_floor_ns > first_target_ns) {
+      first_target_ns = cutover_floor_ns;
+      ++reanchor_cutover_moved_total;
     }
 
     const int64_t phase_before_ns = PresenterSignedDeltaNs(
@@ -10786,15 +10932,73 @@ struct ZeroFGIndependentPresenter::Impl {
     return true;
   }
 
+  // The reanchor cutover: the floor of the first Real the new epoch will
+  // commit. While an older accepted Real has no commitment yet (A still in
+  // production), it is that head; its floor is final once its pair
+  // predecessor holds a commitment (AnchorSyntheticPairsToCommittedReal()
+  // raises it at that commit), and it is not used otherwise. Else it is B,
+  // with the pair boundary its first commitment takes once A holds one
+  // (ComputeAcceptedRealTiming() derives the same floor from the same inputs
+  // right after the metronome). 0 when neither is known.
+  uint64_t ReanchorCutoverFloorNs(uint64_t b_source_id, uint64_t b_issue_ns,
+                                  uint64_t pair_a_source_id,
+                                  bool transition_real_only) const {
+    uint64_t head_source_id = 0;
+    uint64_t head_floor_ns = 0;
+    uint64_t head_pair_a_source_id = 0;
+    for (const LogicalOutput& logical : logical_outputs) {
+      if (logical.state != LogicalOutputState::kFree &&
+          logical.state != LogicalOutputState::kDropped &&
+          logical.candidate.kind == CandidateKind::kReal &&
+          !logical.candidate.target_time_ns &&
+          logical.candidate.source_id < b_source_id &&
+          (!head_source_id || logical.candidate.source_id < head_source_id)) {
+        head_source_id = logical.candidate.source_id;
+        head_floor_ns = logical.candidate.earliest_eligible_time_ns;
+        head_pair_a_source_id = logical.candidate.pair_a_source_id;
+      }
+    }
+    if (head_source_id) {
+      OutputCandidate head_a;
+      if (head_pair_a_source_id &&
+          !FindRealSemanticCommitment(head_pair_a_source_id, head_a)) {
+        return 0;
+      }
+      return head_floor_ns;
+    }
+    OutputCandidate committed_a;
+    uint64_t source_distance = 0;
+    if (!pair_a_source_id || !b_issue_ns ||
+        !FindRealSemanticCommitment(pair_a_source_id, committed_a) ||
+        !AcceptedPairSourceDistance(pair_a_source_id, b_source_id,
+                                    source_distance)) {
+      return 0;
+    }
+    uint64_t synthetic_semantic_ns = 0;
+    uint64_t floor_ns = 0;
+    uint64_t synthetic_target_ns = 0;
+    uint64_t synthetic_tick = 0;
+    if (!ComputePairTimingFromCommittedReal(
+            committed_a,
+            PhaseBoundedPairDistance(committed_a, source_distance, b_issue_ns),
+            synthetic_semantic_ns, floor_ns, synthetic_target_ns,
+            synthetic_tick, transition_real_only)) {
+      return 0;
+    }
+    return floor_ns;
+  }
+
   bool EnsureStableLatencyMetronome(uint64_t source_id, uint64_t issue_ns,
-                                    bool& forward_skipped_out) {
+                                    bool& forward_skipped_out,
+                                    uint64_t pair_a_source_id = 0,
+                                    bool transition_real_only = false) {
     forward_skipped_out = false;
     if (!source_period_ns || !issue_ns) {
       return false;
     }
     if (!stable_latency_metronome_armed) {
       stable_output_quantum_ns =
-          std::max<uint64_t>(source_period_ns / 2, 1);
+          std::max<uint64_t>(LatticePeriodNs() / 2, 1);
       latency_required_last_ns = BoundedRequiredLatencyDepthNs();
       operating_latency_ns =
           std::max(latency_required_last_ns, LatencyDepthBootstrapFloorNs());
@@ -10828,6 +11032,8 @@ struct ZeroFGIndependentPresenter::Impl {
     UpdateBetterDTailStaleState();
     DecayBetterD();
     ApplyBetterDSetpoint();
+    const uint64_t cutover_floor_ns = ReanchorCutoverFloorNs(
+        source_id, issue_ns, pair_a_source_id, transition_real_only);
     const uint64_t issue_anchor_ns =
         SaturatingAddNs(issue_ns, operating_latency_ns);
     const uint64_t current_time_ns = PresenterMonotonicTimeNs();
@@ -10843,16 +11049,20 @@ struct ZeroFGIndependentPresenter::Impl {
     bool source_reanchor_applied = false;
     const uint64_t pre_reanchor_semantic_target_ns = next_semantic_target_ns;
     if (source_rate_transition_reanchor_pending) {
-      RequestSourceReanchor(source_period_ns,
+      // Under the rate lock a confirmed regime transition reforms the lattice
+      // at the lock's period, which it may already follow.
+      const uint64_t lattice_period_ns = LatticePeriodNs();
+      RequestSourceReanchor(lattice_period_ns,
                             SourceReanchorRequestReason::kConfirmedTransition);
       if (stable_output_quantum_ns ==
-          std::max<uint64_t>(source_period_ns / 2, 1)) {
+          std::max<uint64_t>(lattice_period_ns / 2, 1)) {
         source_rate_transition_reanchor_pending = false;
         source_rate_transition_slower_pending = false;
       } else if (ApplyPendingSourcePhaseReanchor(
                      issue_ns, issue_anchor_ns,
                      std::max(issue_anchor_ns, live_anchor_ns),
-                     source_rate_transition_slower_pending)) {
+                     source_rate_transition_slower_pending,
+                     cutover_floor_ns)) {
         source_rate_transition_reanchor_pending = false;
         source_rate_transition_slower_pending = false;
         source_reanchor_applied = true;
@@ -10876,7 +11086,8 @@ struct ZeroFGIndependentPresenter::Impl {
     ObserveSourcePhase(source_id, issue_ns, issue_anchor_ns, forward_skipped_out);
     if (ApplyPendingSourcePhaseReanchor(
             issue_ns, issue_anchor_ns,
-            std::max(issue_anchor_ns, live_anchor_ns))) {
+            std::max(issue_anchor_ns, live_anchor_ns), false,
+            cutover_floor_ns)) {
       ObserveSourceReanchorAnchor(live_anchor_wins);
     }
     return true;
@@ -11122,7 +11333,8 @@ struct ZeroFGIndependentPresenter::Impl {
     const uint64_t source_id =
         current.source_id.load(std::memory_order_relaxed);
     const bool metronome_ready =
-        EnsureStableLatencyMetronome(source_id, issue, forward_skipped_out);
+        EnsureStableLatencyMetronome(source_id, issue, forward_skipped_out,
+                                     pair_a_source_id, transition_real_only);
     ObservePlannedSpaceNewQuantumIssue(source_id, issue);
     if (!metronome_ready ||
         !stable_output_quantum_ns ||
@@ -14835,6 +15047,13 @@ struct ZeroFGIndependentPresenter::Impl {
       uint64_t pair_lattice_distance, uint64_t pair_boundary_tick,
       uint64_t executive_debt_ticks) {
     const OutputCandidate& candidate = logical.candidate;
+    if (candidate.issue_time_ns && operating_latency_ns) {
+      // The rate lock: how much deeper than Better D operates at this Real
+      // was committed (the inherited phase the lock drains through the rate).
+      rate_lock_excess_ns = PresenterSignedDeltaNs(
+          candidate.target_time_ns,
+          SaturatingAddNs(candidate.issue_time_ns, operating_latency_ns));
+    }
     const bool ready_at_commit =
         logical.final_ready_time_ns && now_ns >= logical.final_ready_time_ns;
     const uint64_t ready_age_ns =
@@ -16113,14 +16332,10 @@ struct ZeroFGIndependentPresenter::Impl {
           if (logical->state == LogicalOutputState::kFinalReady) {
             ++h14_b_due_ready_s_ready_total;
           } else {
-            // Split Always-S has no H14 presentation retirement authority:
-            // B remains behind the owed S until S is actually FinalReady.
+            // Split Always-S: no H14 presentation retirement authority. B
+            // stays behind the owed S until S is actually FinalReady.
             ++split_b_ready_waiting_for_s_total;
             break;
-            ++h14_b_due_ready_s_not_ready_hold_total;
-            RetireSyntheticPresentation(logical_index, now);
-            progress = true;
-            continue;
           }
         }
       }
@@ -17388,6 +17603,14 @@ struct ZeroFGIndependentPresenter::Impl {
   }
 
   void LogSummary() {
+    XELOGI(
+        "ZeroFGPacing lattice_P_us={} rate_lock_P_us={} regime_P_us={} O_us={} "
+        "excess_us={} reanchors={} cutover_moved={} guest_pacing_live={}",
+        LatticePeriodNs() / 1000, RateLockPeriodNs() / 1000,
+        source_period_ns / 1000, stable_output_quantum_ns / 1000,
+        rate_lock_excess_ns / 1000, source_phase_reanchor_total,
+        reanchor_cutover_moved_total,
+        ZeroFGGuestPacingLive().load(std::memory_order_relaxed));
     XELOGI(
         "ZeroFGPresentationAdvance enabled={} advance_us={} max_us={} "
         "steps_up/down={}/{} capacity_down={} excess_max_us={} refresh_us={}",
@@ -18729,6 +18952,17 @@ struct ZeroFGIndependentPresenter::Impl {
   uint64_t presentation_advance_steps_down = 0;
   uint64_t presentation_advance_max_ns = 0;
   uint64_t presentation_advance_excess_max_ns = 0;
+  // The rate lock (RateLockPeriodNs).
+  static constexpr size_t kRateLockWindow = 8;
+  // A tenth of the excess depth per period, at most a fifth of the period.
+  static constexpr uint64_t kRateLockGainDivisor = 10;
+  static constexpr uint64_t kRateLockMaxCorrectionDivisor = 5;
+  // The lattice moves only beyond this percent of its period.
+  static constexpr uint64_t kRateLockDeadbandPercent = 3;
+  PresenterSampleWindow<kRateLockWindow> rate_lock_own_interval_ns;
+  int64_t rate_lock_excess_ns = 0;
+  // Reanchors whose new epoch the cutover started at the first Real's floor.
+  uint64_t reanchor_cutover_moved_total = 0;
   uint64_t split_preadmission_total = 0;
   uint64_t split_preadmission_gate_deferred_total = 0;
   uint64_t split_preadmission_other_deferred_total = 0;

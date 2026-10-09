@@ -11,6 +11,7 @@
 #define XENIA_GPU_GRAPHICS_SYSTEM_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -92,6 +93,16 @@ class GraphicsSystem {
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data);
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
 
+  // The guest vblank pull (ZeroFG): a guest frame late for its flip, waiting for the
+  // vblank ISR to clear its flip flag, gets the next vblank now (the command
+  // processor asks). The vblank it replaces on the 60 Hz grid is skipped, so
+  // the guest still sees exactly one vblank per period and its own flip
+  // schedule (which counts vblanks) keeps its speed. Any thread.
+  void RequestVblankPull();
+  uint64_t vblank_pull_fired_total() const {
+    return vblank_pull_fired_total_.load(std::memory_order_relaxed);
+  }
+
   virtual void ClearCaches();
 
   void InvalidateGpuMemory();
@@ -133,7 +144,9 @@ class GraphicsSystem {
   uint32_t ReadRegister(uint32_t addr);
   void WriteRegister(uint32_t addr, uint32_t value);
 
-  void MarkVblank();
+  void MarkVblank(bool pulled = false);
+  // The guest vblank pull: takes a pending request.
+  bool TakeVblankPull();
 
   Memory* memory_ = nullptr;
   cpu::Processor* processor_ = nullptr;
@@ -153,6 +166,15 @@ class GraphicsSystem {
   // 0 before the first vblank fires.
   std::atomic<uint64_t> last_vblank_guest_tick_{0};
   std::atomic<uint64_t> vblank_period_ticks_{0};
+  // A pulled vblank and the one after it are a short and a long interval:
+  // neither is the vblank period.
+  bool vblank_skip_period_sample_ = false;
+
+  // The guest vblank pull (RequestVblankPull).
+  std::mutex vblank_pull_mutex_;
+  std::condition_variable vblank_pull_cv_;
+  bool vblank_pull_requested_ = false;  // guarded by vblank_pull_mutex_
+  std::atomic<uint64_t> vblank_pull_fired_total_{0};
 
   RegisterFile* register_file_;
   std::unique_ptr<CommandProcessor> command_processor_;

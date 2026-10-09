@@ -384,6 +384,17 @@ bool VulkanCommandProcessor::SetupContext() {
   frames_in_flight_limit_ = 2u;
   XELOGI("VulkanCommandProcessor: guest frames in flight limit = {}",
          frames_in_flight_limit_);
+  // A late guest frame gets its vblank at once, only with frame generation.
+  const bool zerofg_requested = xe::ui::vulkan::IsZeroFGRequested();
+  guest_fps_limit_ns_ = zerofg_requested && cvars::zerofg_fps_limit
+                            ? 1000000000ull / cvars::zerofg_fps_limit
+                            : 0;
+  guest_vblank_pull_enabled_ = zerofg_requested;
+  // Both act only while the ZeroFG presenter is connected and not failed open.
+  guest_pacing_live_ = &xe::ui::vulkan::ZeroFGGuestPacingLive();
+  XELOGI("VulkanCommandProcessor: guest vblank pull = {} fps_limit = {}",
+         guest_vblank_pull_enabled_,
+         guest_fps_limit_ns_ ? cvars::zerofg_fps_limit : 0);
 
   // Check if debug markers should be enabled (CVAR or RenderDoc detection).
   UpdateDebugMarkersEnabled();

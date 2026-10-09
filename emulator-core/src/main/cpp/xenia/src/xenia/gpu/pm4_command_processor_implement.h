@@ -808,6 +808,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
                                          frontbuffer_height);
   }
 
+  ApplyGuestFpsLimitBeforeSwap();
+  VblankProbeSwap();
   COMMAND_PROCESSOR::IssueSwap(frontbuffer_ptr, frontbuffer_width,
                                frontbuffer_height);
 
@@ -880,6 +882,11 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
                 : register_file_->values[poll_reg_addr];
 
   bool matched = false;
+  // The vblank probe: when this wait started, if it had to wait at all.
+  uint64_t probe_begin_ns = 0;
+  uint32_t probe_begin_value = 0;
+  uint32_t probe_begin_counter = 0;
+  bool probe_pulled = false;
 
   do {
     uint32_t value = value_ref;
@@ -906,6 +913,17 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
     matched = MatchValueAndRef(value & mask, ref, wait_info);
 
     if (!matched) {
+      // The guest vblank pull: a late frame waiting on its flip flag (asked
+      // again at each poll: it can become due while it waits).
+      if (!probe_pulled && VblankPullDue(poll_reg_addr, is_memory)) {
+        graphics_system_->RequestVblankPull();
+        probe_pulled = true;
+      }
+      if (!probe_begin_ns) {
+        probe_begin_ns = VblankProbeNowNs();
+        probe_begin_value = value;
+        probe_begin_counter = counter_;
+      }
       // Wait using the duration specified by the guest.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -933,6 +951,11 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
     }
   } while (!matched);
 
+  if (probe_begin_ns) {
+    VblankProbeWait(poll_reg_addr, is_memory, probe_begin_ns, wait_info, ref,
+                    mask, probe_begin_value, value_ref, probe_begin_counter,
+                    probe_pulled);
+  }
   return true;
 }
 XE_NOINLINE

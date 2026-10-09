@@ -140,6 +140,35 @@ ZeroFG 1.0 is ready to use, and it has real limits:
   Other GPUs and drivers have not been tested by us yet.
 - **Displays.** It shines with 60 fps games on 120 Hz screens.
 
+## What's new in 1.0.2
+
+- **The output follows the game's real rhythm.** Many 360 games wait for the
+  console's 60 Hz vblank, so a frame that misses one waits for the next: the
+  game alternates 33 and 50 ms frames and never settles. ZeroFG's clock only
+  moved in big confirmed steps and could stay faster or slower than the game:
+  in Batman: Arkham City the delay grew to about half a second for seconds at
+  a time. ZeroFG now follows the average of the game's last frames, measured
+  without the time the game spent waiting on ZeroFG, and runs a little faster
+  than the game while frames sit deeper than it needs, until the delay is
+  gone. Nothing is skipped.
+- **Late game frames go out sooner.** With ZeroFG on, a game frame that is
+  already late for its vblank gets it at once instead of waiting up to 16 ms
+  for the next one. The game still sees 60 vblanks a second, so it never
+  speeds up.
+- **Fewer stutters when the frame rate changes.** When the game changed pace,
+  ZeroFG re-laid its output timing and could leave a slot nothing filled: the
+  frame before it stayed on screen too long. In Modern Warfare 3 these holds
+  fell from about 3 % of the generated frames to under 1 % in its heavy
+  scenes, and the longest gaps got shorter.
+- **A game frame rate cap** (Settings → ZeroFG, or per game in the game's own
+  settings). For games that keep the GPU at 100 %, a cap gives frame
+  generation room to work: Modern Warfare 3 at 40 keeps about 80 frames a
+  second on screen with less lag (70 → 55 ms) and almost no missed refreshes;
+  Halo 3 at 20 halves its lag. A game whose logic runs per frame (Rayman
+  Origins) plays slower under a cap below its own frame rate.
+- **The cap and the vblank help turn off when ZeroFG does.** If ZeroFG has to
+  stop in the middle of a game, the game goes back to running natively.
+
 ## What's new in 1.0.1
 
 - **Lower latency.** ZeroFG's delay could get stuck several frames deeper than
@@ -175,6 +204,11 @@ ZeroFG 1.0 is ready to use, and it has real limits:
   half speed, and the emulator, which leans on the CPU, falls below 30 fps.
 - **Pick the mode.** Zero gives the best image. If the game's own frame rate
   drops with Zero, try ReallyZero, which is lighter on the GPU.
+- **Cap a game that keeps the GPU busy.** If a game wobbles between frame rates
+  with the GPU at 100 %, set its own game frame rate cap a little below its
+  usual rate (Modern Warfare 3: 40, Halo 3: 20): the same frames reach the
+  screen with less lag and a steadier rhythm. Check that the game still plays
+  at normal speed; some games tie their logic to the frame rate.
 - **Below 30 fps.** ZeroFG still makes the motion smoother, but the controls
   feel heavier: it waits for the next game frame, and slow game frames are
   long. In fast shooters below 30 fps you may prefer ZeroFG off.

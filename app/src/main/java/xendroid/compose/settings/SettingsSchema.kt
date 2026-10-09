@@ -26,6 +26,11 @@ object SettingsSchema {
                 "off" to "Off",
                 "zero" to "Zero (best image)",
                 "reallyzero" to "ReallyZero (lighter, for weaker GPUs)"),
+            // Read when a game starts. Best set per game (the game's own settings).
+            l("Vulkan", "zerofg_fps_limit", "Game frame rate cap (with ZeroFG)", "0",
+                "0" to "Off (the game's own cap)", "15" to "15 FPS", "20" to "20 FPS",
+                "24" to "24 FPS", "30" to "30 FPS", "40" to "40 FPS", "45" to "45 FPS",
+                "50" to "50 FPS", "60" to "60 FPS"),
         )),
 
         SettingsCategory("Vulkan", listOf(

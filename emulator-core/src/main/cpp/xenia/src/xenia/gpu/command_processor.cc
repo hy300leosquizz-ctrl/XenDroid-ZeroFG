@@ -591,6 +591,135 @@ void CommandProcessor::FrameStatsEndSwap(uint64_t begin_ns) {
   }
 }
 
+uint64_t CommandProcessor::VblankProbeNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+
+void CommandProcessor::VblankProbeWait(uint32_t address, bool is_memory,
+                                       uint64_t begin_ns, uint32_t wait_info,
+                                       uint32_t ref, uint32_t mask,
+                                       uint32_t begin_value,
+                                       uint32_t end_raw_value,
+                                       uint32_t begin_counter, bool pulled) {
+  VblankProbe& p = vblank_probe_;
+  const uint64_t now = VblankProbeNowNs();
+  const uint64_t wait_ns = now > begin_ns ? now - begin_ns : 0;
+  if (pulled) {
+    ++p.pulls;
+    if (wait_ns < 3000000) {
+      ++p.pull_released;
+    }
+  }
+  if (wait_ns <= p.longest_wait_ns) {
+    return;
+  }
+  const uint64_t last_vblank_ns =
+      vblank_probe_last_vblank_ns_.load(std::memory_order_relaxed);
+  p.longest_wait_ns = wait_ns;
+  p.longest_release_ns = now;
+  p.longest_release_after_vblank_ns =
+      last_vblank_ns && now > last_vblank_ns ? now - last_vblank_ns : 0;
+  p.longest_address = address;
+  p.longest_memory = is_memory;
+  p.longest_function = wait_info & 7;
+  p.longest_ref = ref;
+  p.longest_mask = mask;
+  p.longest_begin_value = begin_value;
+  p.longest_end_raw_value = end_raw_value;
+  p.longest_begin_counter = begin_counter;
+}
+
+bool CommandProcessor::VblankPullDue(uint32_t address, bool is_memory) const {
+  if (!guest_vblank_pull_enabled_ || !GuestPacingLive() || !is_memory ||
+      !vblank_flip_address_ ||
+      address != vblank_flip_address_ || !vblank_probe_.previous_swap_ns) {
+    return false;
+  }
+  const uint64_t period_ns = 1000000000ull / GetGuestVblankRateHz();
+  const uint64_t now = VblankProbeNowNs();
+  const uint64_t since_swap_ns = now > vblank_probe_.previous_swap_ns
+                                     ? now - vblank_probe_.previous_swap_ns
+                                     : 0;
+  // Late for 30 fps (half a millisecond of tolerance for the clocks), or for
+  // the frame rate limit when one is set.
+  const uint64_t due_ns = guest_fps_limit_ns_ ? guest_fps_limit_ns_
+                                              : 2 * period_ns;
+  return since_swap_ns + 500000 >= due_ns;
+}
+
+void CommandProcessor::ApplyGuestFpsLimitBeforeSwap() {
+  if (!guest_fps_limit_ns_ || !GuestPacingLive() ||
+      !vblank_probe_.previous_swap_ns) {
+    return;
+  }
+  // A minimum interval, not a grid: a late frame never buys an early one.
+  const uint64_t due_ns =
+      vblank_probe_.previous_swap_ns + guest_fps_limit_ns_ - 200000;
+  const uint64_t now = VblankProbeNowNs();
+  if (now < due_ns) {
+    xe::threading::NanoSleepPrecise(due_ns - now);
+  }
+}
+
+void CommandProcessor::VblankProbeSwap() {
+  VblankProbe& p = vblank_probe_;
+  const uint64_t now = VblankProbeNowNs();
+  const uint32_t counter = counter_;
+  if (p.previous_swap_ns) {
+    const uint32_t i = p.swaps++;
+    const uint32_t vblanks = counter - p.previous_swap_counter;
+    const size_t bucket = std::min<uint32_t>(vblanks, 4);
+    ++p.vblanks_between[bucket];
+    p.interval_us[i] = (now - p.previous_swap_ns) / 1000;
+    p.wait_us[i] = p.longest_wait_ns / 1000;
+    p.wait_us_by_vblanks[bucket] += p.longest_wait_ns / 1000;
+    if (p.longest_wait_ns >= 1000000) {
+      // A wait of a millisecond or more votes for its address as the flip
+      // flag.
+      ++p.waited;
+      const uint32_t r = p.release_samples++;
+      p.release_after_vblank_us[r] = p.longest_release_after_vblank_ns / 1000;
+      p.swap_after_release_us[r] = (now - p.longest_release_ns) / 1000;
+      if (p.longest_release_after_vblank_ns < 2000000) {
+        ++p.released_by_vblank;
+      }
+      if (!p.address_votes) {
+        p.address = p.longest_address;
+        p.address_memory = p.longest_memory;
+        p.address_votes = 1;
+      } else if (p.address == p.longest_address) {
+        ++p.address_votes;
+      } else {
+        --p.address_votes;
+      }
+    }
+  }
+  p.previous_swap_ns = now;
+  p.previous_swap_counter = counter;
+  p.longest_wait_ns = 0;
+  p.longest_release_ns = 0;
+  p.longest_release_after_vblank_ns = 0;
+  if (p.swaps < VblankProbe::kWindow) {
+    return;
+  }
+  // The flip flag: one memory address was the longest wait before most of
+  // the window's swaps.
+  if (p.address_memory && p.address_votes >= VblankProbe::kWindow * 2 / 3 &&
+      vblank_flip_address_ != p.address) {
+    vblank_flip_address_ = p.address;
+    XELOGI("VblankProbe flip_address={:08X} pull={} fps_limit_us={}",
+           vblank_flip_address_, guest_vblank_pull_enabled_,
+           guest_fps_limit_ns_ / 1000);
+  }
+  const uint64_t previous_swap_ns = p.previous_swap_ns;
+  const uint32_t previous_swap_counter = p.previous_swap_counter;
+  p = VblankProbe();
+  p.previous_swap_ns = previous_swap_ns;
+  p.previous_swap_counter = previous_swap_counter;
+}
+
 void CommandProcessor::ThrottlePresentation() {
   // Host frame rate limiting based on framerate_limit cvar.
   const uint32_t framerate_limit = cvars::framerate_limit;

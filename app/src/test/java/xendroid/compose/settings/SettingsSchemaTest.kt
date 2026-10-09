@@ -13,13 +13,14 @@ class SettingsSchemaTest {
 
     private val all = SettingsSchema.allSettings
 
-    // Expected inventory of the 1.0 release: 101 Bool + 12 IntRange + 22 ListChoice + 2 Action = 137.
+    // Expected inventory of the 1.0.2 release: 101 Bool + 12 IntRange + 23 ListChoice + 2 Action = 138
+    // (1.0: 137; 1.0.2 adds the game frame rate cap).
     // GPU|readback_resolve and APU|xma_decoder are string cvars (fast/some/full/none and the
     // decoder name), hence ListChoice rather than Bool.
-    @Test fun total_entry_count_is_137() {
-        assertEquals(137, all.size)
+    @Test fun total_entry_count_is_138() {
+        assertEquals(138, all.size)
         assertEquals(
-            137,
+            138,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action },
         )
@@ -39,7 +40,7 @@ class SettingsSchemaTest {
     @Test fun counts_by_type_match_verified_inventory() {
         assertEquals(101, all.count { it is Setting.Bool })
         assertEquals(12, all.count { it is Setting.IntRange })
-        assertEquals(22, all.count { it is Setting.ListChoice })
+        assertEquals(23, all.count { it is Setting.ListChoice })
         assertEquals(2, all.count { it is Setting.Action })
     }
 
@@ -127,7 +128,12 @@ class SettingsSchemaTest {
 
     @Test fun zerofg_exposes_the_product_controls_only() {
         val zerofg = SettingsSchema.categories.single { it.title == "ZeroFG" }
-        assertEquals(listOf("zerofg_mode"), zerofg.settings.map { it.name })
+        assertEquals(listOf("zerofg_mode", "zerofg_fps_limit"), zerofg.settings.map { it.name })
+        // 1.0.2: the game frame rate cap, off by default, a user choice per game.
+        val cap = zerofg.settings.single { it.name == "zerofg_fps_limit" } as Setting.ListChoice
+        assertEquals("0", cap.default)
+        assertEquals(listOf("0", "15", "20", "24", "30", "40", "45", "50", "60"), cap.options.map { it.value })
+        assertTrue(cap.desc.isNotBlank())
         // Development switches, variants and diagnostics stay out of the release.
         listOf(
             "zerofg_rc1_test_backend",

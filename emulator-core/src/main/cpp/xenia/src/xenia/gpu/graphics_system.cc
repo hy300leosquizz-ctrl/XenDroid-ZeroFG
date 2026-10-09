@@ -9,6 +9,9 @@
 
 #include "xenia/gpu/graphics_system.h"
 
+#include <algorithm>
+#include <chrono>
+
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
@@ -23,6 +26,15 @@
 #include "xenia/ui/graphics_provider.h"
 #include "xenia/ui/window.h"
 #include "xenia/ui/windowed_app_context.h"
+
+DEFINE_uint32(
+    zerofg_fps_limit, 0,
+    "With ZeroFG on, a frame rate cap for the game (0 = off): its swaps are "
+    "held at least 1/limit apart, and a frame waiting for its flip that long "
+    "after the previous one gets the next vblank at once. The game still sees "
+    "one vblank per period, so it never speeds up; a game whose logic runs per "
+    "frame plays slower under a cap below its own rate.",
+    "Vulkan");
 
 DEFINE_uint32(internal_display_resolution, 8,
               "Allow games that support different resolutions to render "
@@ -219,6 +231,9 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                 const uint64_t current_time = Clock::QueryGuestTickCount();
                 const uint64_t time_delta = current_time - last_frame_time;
 
+                // The guest vblank pull: never two vblanks closer than this.
+                const uint64_t pull_spacing_ticks = tick_freq / 250;
+                bool pull_waiting = false;
                 if (time_delta >= target_duration_ticks) {
                   // More than 2 periods behind: resync instead of firing a
                   // burst of catch-up vblanks.
@@ -228,18 +243,53 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                     last_frame_time += target_duration_ticks;
                   }
                   MarkVblank();
+                  // A pull asked for before this vblank is answered by it.
+                  TakeVblankPull();
+                } else if (TakeVblankPull()) {
+                  // The vblank due at the next grid point fires now and that
+                  // grid point is consumed: still one vblank per period.
+                  const uint64_t last_vblank =
+                      last_vblank_guest_tick_.load(std::memory_order_acquire);
+                  if (last_vblank &&
+                      current_time - last_vblank < pull_spacing_ticks) {
+                    // Too close to the last one: keep it for a moment.
+                    std::lock_guard<std::mutex> lock(vblank_pull_mutex_);
+                    vblank_pull_requested_ = true;
+                    pull_waiting = true;
+                  } else {
+                    last_frame_time += target_duration_ticks;
+                    vblank_pull_fired_total_.fetch_add(
+                        1, std::memory_order_relaxed);
+                    MarkVblank(true);
+                  }
                 }
                 // Sleep only until the next deadline, precisely: the plain
                 // NanoSleep quantum overshoot is exactly what starved the
-                // cadence.
+                // cadence. A vblank pull request wakes it early.
                 {
                   const uint64_t now = Clock::QueryGuestTickCount();
-                  const uint64_t next = last_frame_time + target_duration_ticks;
+                  uint64_t next = last_frame_time + target_duration_ticks;
+                  if (pull_waiting) {
+                    next = std::min(
+                        next,
+                        last_vblank_guest_tick_.load(std::memory_order_acquire) +
+                            pull_spacing_ticks);
+                  }
                   if (next > now) {
                     const uint64_t remain_ticks = next - now;
                     const uint64_t remain_ns = static_cast<uint64_t>(
                         remain_ticks * (1000000000.0 / tick_freq));
-                    threading::NanoSleepPrecise(remain_ns);
+                    // Only a session with the pull waits on it; the native
+                    // path keeps the precise sleep.
+                    if (command_processor_ &&
+                        command_processor_->GuestVblankPullActive()) {
+                      std::unique_lock<std::mutex> lock(vblank_pull_mutex_);
+                      vblank_pull_cv_.wait_for(
+                          lock, std::chrono::nanoseconds(remain_ns),
+                          [&] { return vblank_pull_requested_ && !pull_waiting; });
+                    } else {
+                      threading::NanoSleepPrecise(remain_ns);
+                    }
                   }
                 }
 #endif
@@ -430,7 +480,22 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
                                         interrupt_callback_data_, source, cpu);
 }
 
-void GraphicsSystem::MarkVblank() {
+void GraphicsSystem::RequestVblankPull() {
+  {
+    std::lock_guard<std::mutex> lock(vblank_pull_mutex_);
+    vblank_pull_requested_ = true;
+  }
+  vblank_pull_cv_.notify_one();
+}
+
+bool GraphicsSystem::TakeVblankPull() {
+  std::lock_guard<std::mutex> lock(vblank_pull_mutex_);
+  const bool requested = vblank_pull_requested_;
+  vblank_pull_requested_ = false;
+  return requested;
+}
+
+void GraphicsSystem::MarkVblank(bool pulled) {
   SCOPE_profile_cpu_f("gpu");
 
   // No guest vblank ISR while paused (a halted GPU raises no interrupts).
@@ -443,9 +508,10 @@ void GraphicsSystem::MarkVblank() {
     const uint64_t now = Clock::QueryGuestTickCount();
     const uint64_t prev =
         last_vblank_guest_tick_.exchange(now, std::memory_order_acq_rel);
-    if (prev && now > prev) {
+    if (prev && now > prev && !pulled && !vblank_skip_period_sample_) {
       vblank_period_ticks_.store(now - prev, std::memory_order_release);
     }
+    vblank_skip_period_sample_ = pulled;
 
     // Increment vblank counter (so the game sees us making progress).
     command_processor_->increment_counter();

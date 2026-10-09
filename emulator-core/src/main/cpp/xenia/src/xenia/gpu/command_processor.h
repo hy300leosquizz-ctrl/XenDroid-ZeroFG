@@ -10,6 +10,7 @@
 #ifndef XENIA_GPU_COMMAND_PROCESSOR_H_
 #define XENIA_GPU_COMMAND_PROCESSOR_H_
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <deque>
@@ -140,7 +141,16 @@ class CommandProcessor {
                    kernel::KernelState* kernel_state);
   virtual ~CommandProcessor();
   uint32_t counter() const { return counter_; }
-  void increment_counter() { counter_++; }
+  // The guest vblank pull is on for this session and ZeroFG is live: the
+  // vblank limiter then waits on pull requests instead of sleeping.
+  bool GuestVblankPullActive() const {
+    return guest_vblank_pull_enabled_ && GuestPacingLive();
+  }
+  void increment_counter() {
+    counter_++;
+    vblank_probe_last_vblank_ns_.store(VblankProbeNowNs(),
+                                       std::memory_order_relaxed);
+  }
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
@@ -663,6 +673,89 @@ class CommandProcessor {
 
   // For host frame rate limiting at IssueSwap
   uint64_t last_swap_time_ = 0;
+
+  // The vblank probe. A game on the 60 Hz guest vsync that misses its second
+  // vblank swaps on the third: its frames are 33 or 50 ms, never 36. The wait
+  // is an unmatched WAIT_REG_MEM that the vblank ISR releases right before the
+  // swap; the probe learns its address (the longest wait before most swaps of
+  // a VblankProbe::kWindow window) so the guest vblank pull can release a late
+  // frame at once with frame generation on. Logged when the address changes.
+  static uint64_t VblankProbeNowNs();
+  void VblankProbeWait(uint32_t address, bool is_memory, uint64_t begin_ns,
+                       uint32_t wait_info, uint32_t ref, uint32_t mask,
+                       uint32_t begin_value, uint32_t end_raw_value,
+                       uint32_t begin_counter, bool pulled);
+  // The guest vblank pull (ZeroFG). Halo 3 showed the flip wait:
+  // a WAIT_REG_MEM on one memory flag until it reads 0 (function ==, ref 0),
+  // set to 1 before the wait and cleared by the guest's vblank ISR at the
+  // first vblank after the frame is ready and due on the guest's own flip
+  // schedule (which counts vblanks and catches up after a late frame). A
+  // frame past two vblanks since the previous swap is late for 30 fps:
+  // GraphicsSystem then fires the next vblank now and skips the one it
+  // replaces, so the guest's vblank count per second is unchanged and its
+  // schedule cannot speed up. True when this unmatched wait should get it.
+  bool VblankPullDue(uint32_t address, bool is_memory) const;
+  // Set by the host command processor: ZeroFG is requested. It acts only
+  // while GuestPacingLive().
+  bool guest_vblank_pull_enabled_ = false;
+  // zerofg_fps_limit, as a minimum swap interval (0: off). With it, a pull is
+  // due at that interval instead of two vblanks (still moving a vblank, never
+  // adding one), and the swap waits for it.
+  uint64_t guest_fps_limit_ns_ = 0;
+  void ApplyGuestFpsLimitBeforeSwap();
+  // ZeroFG's live flag, set by the host command processor: the pull and the
+  // frame rate cap act only while a ZeroFG presenter is connected and has not
+  // failed open, so a fallback to the native path is native. Null: always.
+  const std::atomic<bool>* guest_pacing_live_ = nullptr;
+  bool GuestPacingLive() const {
+    return !guest_pacing_live_ ||
+           guest_pacing_live_->load(std::memory_order_acquire);
+  }
+  // The flip flag's address, learned by VblankProbe (a window where one
+  // address was the longest wait before most swaps). 0 until then.
+  uint32_t vblank_flip_address_ = 0;
+  void VblankProbeSwap();
+  struct VblankProbe {
+    static constexpr uint32_t kWindow = 300;
+    // Since the previous swap: the longest unmatched WAIT_REG_MEM.
+    uint64_t longest_wait_ns = 0;
+    uint64_t longest_release_ns = 0;
+    uint64_t longest_release_after_vblank_ns = 0;
+    uint32_t longest_address = 0;
+    bool longest_memory = false;
+    // The protocol of the longest wait: what it compared, against what, and
+    // the vblank counter when it began.
+    uint32_t longest_function = 0;
+    uint32_t longest_ref = 0;
+    uint32_t longest_mask = 0;
+    uint32_t longest_begin_value = 0;
+    uint32_t longest_end_raw_value = 0;
+    uint32_t longest_begin_counter = 0;
+    uint32_t protocol_samples = 0;  // logged per window
+    uint64_t previous_swap_ns = 0;
+    uint32_t previous_swap_counter = 0;
+    // The window.
+    uint32_t swaps = 0;
+    uint32_t waited = 0;              // a wait of 1 ms or more before the swap
+    uint32_t released_by_vblank = 0;  // ... released within 2 ms of a vblank
+    std::array<uint32_t, 5> vblanks_between = {};
+    std::array<uint64_t, 5> wait_us_by_vblanks = {};
+    std::array<uint64_t, kWindow> interval_us = {};
+    std::array<uint64_t, kWindow> wait_us = {};
+    std::array<uint64_t, kWindow> release_after_vblank_us = {};
+    std::array<uint64_t, kWindow> swap_after_release_us = {};
+    uint32_t release_samples = 0;
+    // The address that was most often the longest wait (majority vote).
+    uint32_t address = 0;
+    bool address_memory = false;
+    uint32_t address_votes = 0;
+    // The guest vblank pull: waits that asked for a pulled vblank, and
+    // those released within 3 ms of asking.
+    uint32_t pulls = 0;
+    uint32_t pull_released = 0;
+  };
+  VblankProbe vblank_probe_;
+  std::atomic<uint64_t> vblank_probe_last_vblank_ns_{0};
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
