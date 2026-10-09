@@ -301,6 +301,11 @@ bool ZeroFGMainSurfaceEgress::HasCapacity() const {
   return !stop_requested_ && ring_count_ < slot_count_;
 }
 
+uint64_t ZeroFGMainSurfaceEgress::RefreshCycleNs() const {
+  std::lock_guard<std::mutex> lock(stats_mutex_);
+  return counters_.refresh_cycle_now_ns;
+}
+
 ZeroFGMainSurfaceEgress::EnqueueResult ZeroFGMainSurfaceEgress::TryEnqueue(
     const Request& request) {
   {

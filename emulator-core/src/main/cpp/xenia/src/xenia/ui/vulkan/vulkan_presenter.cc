@@ -31,9 +31,11 @@
 #include "xenia/base/platform.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
+#include "xenia/ui/vulkan/zerofg_build_guard.h"
 #include "xenia/ui/vulkan/zerofg_completion_owner.h"
 #include "xenia/ui/vulkan/zerofg_config.h"
 #include "xenia/ui/vulkan/zerofg_device_handoff.h"
+#include "version.h"
 
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
 #include <errno.h>
@@ -58,6 +60,7 @@
 DECLARE_bool(adrenotools_force_max_clocks);
 DECLARE_uint32(gpu_stall_spin_iterations);
 DECLARE_bool(host_present_from_non_ui_thread);
+DECLARE_path(storage_root);
 DECLARE_double(time_scalar);
 DECLARE_string(turnip_debug);
 DECLARE_bool(use_50Hz_mode);
@@ -122,6 +125,19 @@ constexpr bool kZeroFGSyncFdSupported = true;
 #else
 constexpr bool kZeroFGSyncFdSupported = false;
 #endif
+
+// What a ZeroFG pipeline build verdict belongs to (zerofg_build_guard.h): the
+// driver, the engine whose shaders it compiles and the app build that shipped
+// them.
+std::string ZeroFGBuildIdentity(const VulkanDevice& device) {
+  const VulkanDevice::Properties& properties = device.properties();
+  return fmt::format(
+      "vendor={:#x} device={:#x} driverID={} driverVersion={:#x} name={} "
+      "engine=rc3 build={}",
+      properties.vendorID, properties.deviceID,
+      uint32_t(properties.driverID), properties.driverVersion,
+      properties.deviceName, XE_BUILD_COMMIT_SHORT);
+}
 
 }  // namespace
 
@@ -1738,6 +1754,8 @@ struct VulkanPresenter::ZeroFGGenerationContext {
   uint32_t timestamp_valid_bits = 0;
   double timestamp_period_ns = 0.0;
   uint32_t timestamp_query_count_per_context = 0;
+  // The adapter runs the Compat forms (what the build guard records).
+  bool compat_backend = false;
   uint64_t next_timeline_value = 1;
   VkExtent2D extent = {};
   uint32_t pool_high_water = 0;
@@ -2669,7 +2687,22 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
   const bool baseline_available =
       vulkan_device_->properties().apiVersion >= VK_API_VERSION_1_3 &&
       vulkan_device_->properties().synchronization2;
-  const bool device_context_available = InitializeZeroFGDeviceContext();
+  // A driver that died building ZeroFG's pipelines on the Compat forms keeps
+  // ZeroFG off, and one that died on its fast paths runs Compat, until the
+  // driver or the app build changes (zerofg_build_guard.h).
+  const ZeroFGBuildGuard::Verdict build_verdict =
+      IsZeroFGRequested()
+          ? ZeroFGBuildGuard::Get().Initialize(
+                cvars::storage_root, ZeroFGBuildIdentity(*vulkan_device_))
+          : ZeroFGBuildGuard::Verdict::kNone;
+  const bool build_guard_off =
+      build_verdict == ZeroFGBuildGuard::Verdict::kOff;
+  const bool device_context_available =
+      !build_guard_off && InitializeZeroFGDeviceContext();
+  if (device_context_available &&
+      build_verdict == ZeroFGBuildGuard::Verdict::kCompat) {
+    zerofg_vulkan_context_->backend_fallback_active = true;
+  }
   if (IsZeroFGRequested() && baseline_available &&
       device_context_available) {
     zerofg_independent_presenter_ = ZeroFGIndependentPresenter::Create(
@@ -2714,6 +2747,10 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
           "ZeroFGOutput path=main_surface_fifo "
           "present_authority=fifo_vblank producer=device_B");
     }
+  } else if (build_guard_off) {
+    XELOGE(
+        "ZeroFGBuildGuard: this driver crashed building ZeroFG's Compat "
+        "pipelines; ZeroFG stays off and the normal XenDroid presenter runs");
   } else if (IsZeroFGRequested() && !device_context_available) {
     XELOGE(
         "ZeroFGDeviceSplit activation_failed=device_B_qualification "
@@ -3292,11 +3329,17 @@ bool VulkanPresenter::PrepareZeroFGGenerationContext(
   }
   // Auto: the generic fast paths the device really has (Modern); a failure
   // retries once on Compat (ZeroFGBackendFallback).
-  context->adapter = zerofg::xenia::Adapter::Create(
-      vulkan, ZeroFGGenerationContext::kContextCount,
-      IsReallyZeroRequested() ? zerofg::Mode::kReallyZero : zerofg::Mode::kZero,
-      backend_fallback ? zerofg::Backend::kCompat : zerofg::Backend::kAuto,
-      capabilities, &adapter_status);
+  context->compat_backend = backend_fallback;
+  {
+    const ZeroFGBuildGuard::Scope build =
+        ZeroFGBuildGuard::Get().Build("adapter", context->compat_backend);
+    context->adapter = zerofg::xenia::Adapter::Create(
+        vulkan, ZeroFGGenerationContext::kContextCount,
+        IsReallyZeroRequested() ? zerofg::Mode::kReallyZero
+                                : zerofg::Mode::kZero,
+        backend_fallback ? zerofg::Backend::kCompat : zerofg::Backend::kAuto,
+        capabilities, &adapter_status);
+  }
   if (!context->adapter) {
     util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device,
                                context->timestamp_query_pool);
@@ -3545,9 +3588,18 @@ bool VulkanPresenter::ProcessZeroFGGeneration(
                     [](bool busy) { return busy; })) {
       return fail(FailureStage::kResize);
     }
-    const zerofg::Status resize_status = context.adapter->Resize(
-        request.extent.width, request.extent.height, kGuestOutputFormat,
-        kGuestOutputFormat);
+    zerofg::Status resize_status = zerofg::Status::kSuccess;
+    {
+      // RC3 builds its pipelines here, at the first Generation.
+      const ZeroFGBuildGuard::Scope build =
+          ZeroFGBuildGuard::Get().Build("resize", context.compat_backend);
+      resize_status = context.adapter->Resize(
+          request.extent.width, request.extent.height, kGuestOutputFormat,
+          kGuestOutputFormat);
+    }
+    XELOGI("ZeroFGGeneration resize picture={}x{} status={}",
+           request.extent.width, request.extent.height,
+           uint32_t(resize_status));
     if (resize_status != zerofg::Status::kSuccess) {
       if (resize_status == zerofg::Status::kVulkanError &&
           !zerofg_vulkan_context_->backend_fallback_active) {

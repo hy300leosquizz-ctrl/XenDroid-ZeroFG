@@ -1833,9 +1833,11 @@ struct ZeroFGIndependentPresenter::Impl {
     XELOGI("ZeroFGMainSurface egress_queue=B:{} timing_available={}",
            vulkan_device->queue_index_zerofg_main_surface_present(),
            vulkan_device->vkGetPastPresentationTimingGOOGLE() != nullptr);
-    // ZeroFG pacing section 7 is part of the working point: always on (the
-    // former zerofg_physical_operating_point switch was removed).
-    split_physical_operating_point_enabled = true;
+    // ZeroFG pacing section 7 is off since 1.0.1. It was built for ZeroFG's
+    // work stuck behind the game's on the GPU, which GPU priority solved;
+    // what was left of it was a 20 fps lock at the capacity of the pools
+    // (~540 ms) under ZeroFG stalls (2026-10-08 DEV runs).
+    split_physical_operating_point_enabled = false;
 
     if (!InitializeIngressContexts()) {
       XELOGW("ZeroFGC0: failed to initialize dormant D6 ingress contexts");
@@ -3623,6 +3625,17 @@ struct ZeroFGIndependentPresenter::Impl {
     latency_depth_lattice_compacted_ns = 0;
     split_present_spacing_push_max_ns = 0;
     split_preaccept_capacity_gate_total = 0;
+    presentation_advance_ns = 0;
+    presentation_advance_outputs_since = 0;
+    presentation_advance_up_streak = 0;
+    presentation_advance_late_streak = 0;
+    presentation_advance_below_streak = 0;
+    presentation_advance_gate_seen = 0;
+    presentation_advance_capacity_down = 0;
+    presentation_advance_steps_up = 0;
+    presentation_advance_steps_down = 0;
+    presentation_advance_max_ns = 0;
+    presentation_advance_excess_max_ns = 0;
     split_preadmission_total = 0;
     split_preadmission_gate_deferred_total = 0;
     split_preadmission_other_deferred_total = 0;
@@ -14414,9 +14427,121 @@ struct ZeroFGIndependentPresenter::Impl {
     return progress;
   }
 
+  // The presentation advance (1.0.1): the semantic target is unchanged (lattice,
+  // order, commitments and the contract keep it), the physical presentation
+  // goes this much earlier. Every dispatch decision and the egress's desired
+  // time read the target through here.
+  uint64_t PresentationTargetNs(const LogicalOutput& logical) const {
+    const uint64_t target_ns = logical.candidate.target_time_ns;
+    if (!presentation_advance_ns || !target_ns) {
+      return target_ns;
+    }
+    return target_ns > presentation_advance_ns
+               ? target_ns - presentation_advance_ns
+               : 1;
+  }
+
+  // The drain of the latency well without skipping anything. Observed at
+  // every applied output, R and S. The advance grows one panel refresh after
+  // kPresentationAdvanceRiseStreak Reals in a row that still reach the panel
+  // two refreshes or more past Better D's operating depth, with every output
+  // in that streak, S included, FinalReady two refreshes or more before its
+  // advanced planned dispatch. It shrinks one refresh after
+  // kPresentationAdvanceLateStreak outputs in a row late at their advanced
+  // dispatch, at once on a capacity-gate refusal, or after
+  // kPresentationAdvanceRiseStreak Reals below the operating depth. At most one
+  // move every kPresentationAdvanceEvery outputs, never past
+  // kPresentationAdvanceMaxNs. A step changes only the next interval.
+  //
+  // S counts because an S needs its B captured: an advance that asks S before
+  // it can exist hangs S obligations, the capacity gate then holds the next
+  // Reals, and the phase it was draining comes back larger. 2026-10-08, Halo 3
+  // hot at 15 fps: watching Reals only, the advance climbed to its 400 ms cap
+  // while the gate went 0 -> 15515 refusals and the latency to ~690 ms.
+  // Before that, an undamped form stepped every second output (576 up, 580
+  // down in three minutes).
+  void ObservePresentationAdvance(const LogicalOutput& logical,
+                                  uint64_t planned_dispatch_ns) {
+    ++presentation_advance_outputs_since;
+    if (!kPresentationAdvanceEnabled || !stable_output_quantum_ns ||
+        !main_surface_egress) {
+      return;
+    }
+    const uint64_t refresh_ns = main_surface_egress->RefreshCycleNs();
+    if (!refresh_ns || stable_output_quantum_ns <= refresh_ns + refresh_ns / 8) {
+      // No vsync to gain inside one output quantum.
+      return;
+    }
+    const int64_t band_ns = int64_t(refresh_ns) * 2;
+    // How long before its (advanced) planned dispatch the output was
+    // FinalReady; negative: it was late.
+    const int64_t ready_slack_ns =
+        logical.final_ready_time_ns
+            ? PresenterSignedDeltaNs(planned_dispatch_ns,
+                                     logical.final_ready_time_ns)
+            : 0;
+    const bool capacity_refused =
+        split_preaccept_capacity_gate_total != presentation_advance_gate_seen;
+    presentation_advance_gate_seen = split_preaccept_capacity_gate_total;
+    const bool late = logical.final_ready_time_ns && ready_slack_ns < 0;
+    presentation_advance_late_streak =
+        late ? presentation_advance_late_streak + 1 : 0;
+    if (ready_slack_ns < band_ns || capacity_refused) {
+      presentation_advance_up_streak = 0;
+    }
+    const bool real = logical.candidate.kind == CandidateKind::kReal &&
+                      logical.candidate.issue_time_ns && operating_latency_ns;
+    if (real) {
+      const int64_t excess_ns = PresenterSignedDeltaNs(
+          PresentationTargetNs(logical),
+          SaturatingAddNs(logical.candidate.issue_time_ns,
+                          operating_latency_ns));
+      presentation_advance_excess_max_ns =
+          std::max(presentation_advance_excess_max_ns,
+                   excess_ns > 0 ? uint64_t(excess_ns) : 0);
+      if (excess_ns >= band_ns && ready_slack_ns >= band_ns &&
+          !capacity_refused) {
+        ++presentation_advance_up_streak;
+      } else {
+        presentation_advance_up_streak = 0;
+      }
+      presentation_advance_below_streak =
+          excess_ns < 0 ? presentation_advance_below_streak + 1 : 0;
+    }
+    if (presentation_advance_ns && capacity_refused) {
+      ++presentation_advance_capacity_down;
+    } else if (presentation_advance_outputs_since < kPresentationAdvanceEvery) {
+      return;
+    }
+    if (presentation_advance_ns &&
+        (capacity_refused ||
+         presentation_advance_late_streak >= kPresentationAdvanceLateStreak ||
+         presentation_advance_below_streak >=
+             kPresentationAdvanceRiseStreak)) {
+      presentation_advance_ns = presentation_advance_ns > refresh_ns
+                                    ? presentation_advance_ns - refresh_ns
+                                    : 0;
+      presentation_advance_outputs_since = 0;
+      presentation_advance_late_streak = 0;
+      presentation_advance_below_streak = 0;
+      presentation_advance_up_streak = 0;
+      ++presentation_advance_steps_down;
+      return;
+    }
+    if (real &&
+        presentation_advance_up_streak >= kPresentationAdvanceRiseStreak &&
+        presentation_advance_ns + refresh_ns <= kPresentationAdvanceMaxNs) {
+      presentation_advance_ns += refresh_ns;
+      presentation_advance_outputs_since = 0;
+      presentation_advance_up_streak = 0;
+      ++presentation_advance_steps_up;
+      presentation_advance_max_ns =
+          std::max(presentation_advance_max_ns, presentation_advance_ns);
+    }
+  }
+
   uint64_t PlannedDispatchTimeNs(const LogicalOutput& logical) const {
-    const uint64_t target_ns =
-        logical.candidate.target_time_ns;
+    const uint64_t target_ns = PresentationTargetNs(logical);
     return target_ns > logical.dispatch_lead_ns
                ? target_ns - logical.dispatch_lead_ns
                : target_ns;
@@ -15486,8 +15611,7 @@ struct ZeroFGIndependentPresenter::Impl {
   }
 
   uint64_t PhysicalPresentNotBeforeNs(const LogicalOutput& logical) const {
-    uint64_t present_not_before_ns =
-        logical.candidate.target_time_ns;
+    uint64_t present_not_before_ns = PresentationTargetNs(logical);
     if (logical.post_completion_ready_time_ns) {
       present_not_before_ns = std::max(
           present_not_before_ns,
@@ -15690,6 +15814,7 @@ struct ZeroFGIndependentPresenter::Impl {
         transaction_prepare_begin_ns < planned_dispatch_time_ns) {
       ++apply_before_planned_violation_total;
     }
+    ObservePresentationAdvance(logical, planned_dispatch_time_ns);
     dispatch_start_late_ns.Add(
         planned_dispatch_time_ns &&
                 transaction_prepare_begin_ns > planned_dispatch_time_ns
@@ -17264,6 +17389,15 @@ struct ZeroFGIndependentPresenter::Impl {
 
   void LogSummary() {
     XELOGI(
+        "ZeroFGPresentationAdvance enabled={} advance_us={} max_us={} "
+        "steps_up/down={}/{} capacity_down={} excess_max_us={} refresh_us={}",
+        kPresentationAdvanceEnabled, presentation_advance_ns / 1000,
+        presentation_advance_max_ns / 1000, presentation_advance_steps_up,
+        presentation_advance_steps_down, presentation_advance_capacity_down,
+        presentation_advance_excess_max_ns / 1000,
+        main_surface_egress ? main_surface_egress->RefreshCycleNs() / 1000
+                            : 0);
+    XELOGI(
         "ZeroFGDeviceB domain=presenter_B Source_q0_counts_exclude_B=true "
         "ingress_queue_busy_retry={} submit_after_teardown_idle={} "
         "ingress_queue/submit_us_p90={}/{} "
@@ -17465,9 +17599,11 @@ struct ZeroFGIndependentPresenter::Impl {
                PresenterWakeReason::kGpuPoll, GpuPollSource::kIngressRetry);
     }
     const bool source_reserve_emergency = CountSourceIngressSlots() >= 2;
+    // A drain waits for every Capture transfer: never sleep without a poll
+    // deadline while one remains.
     if (CountCaptureTransfers() &&
         (CaptureReclamationObservationRequired() ||
-         source_reserve_emergency)) {
+         source_reserve_emergency || presenter_draining)) {
       consider(SaturatingAddNs(now_ns, kOwnershipPollIntervalNs),
                PresenterWakeReason::kGpuPoll, GpuPollSource::kCaptureReclaim);
     }
@@ -17570,6 +17706,7 @@ struct ZeroFGIndependentPresenter::Impl {
     presenter_thread_started.store(true, std::memory_order_release);
     ApplyThreadPriority();
     bool draining = false;
+    presenter_draining = false;
     for (;;) {
       const uint64_t cycle_entry_ns = PresenterMonotonicTimeNs();
       previous_cycle_blocking_operation = arbiter_last_blocking_operation;
@@ -17602,6 +17739,7 @@ struct ZeroFGIndependentPresenter::Impl {
            detach_requested.load(std::memory_order_acquire));
       if (stopping && !draining) {
         draining = true;
+        presenter_draining = true;
         BeginAsyncDrainForShutdown();
       }
       bool progress = false;
@@ -17661,7 +17799,16 @@ struct ZeroFGIndependentPresenter::Impl {
           capture_used_before != 0;
 
       if (draining) {
-        const DriverPollResult poll = PollOneNormalDriverObservation();
+        // The drain exits only when no Capture transfer remains, and normal
+        // polling no longer observes them: poll them here first (after the
+        // teardown drain B is idle and every transfer reads complete). Without
+        // it a fail-open with a Real in flight never reached the handback, and
+        // the screen froze on B's last frame while the game ran (Halo 3, a
+        // Resize refusal at the first Generation, 2026-10-08).
+        DriverPollResult poll = PollCaptureTransfers();
+        if (!poll.invoked) {
+          poll = PollOneNormalDriverObservation();
+        }
         host_driver_operation_invoked = poll.invoked;
         progress |= poll.progress;
       } else {
@@ -18443,6 +18590,8 @@ struct ZeroFGIndependentPresenter::Impl {
   uint64_t h1c_false_positive_pair_total = 0;
   uint64_t h1c_post_confirm_quarantine_total = 0;
   uint64_t h1c_drain_complete_total = 0;
+  // The presenter loop is draining toward its exit (PresenterThreadMain).
+  bool presenter_draining = false;
   uint64_t h1c_timeout_total = 0;
   uint64_t h1c_reset_total = 0;
   uint64_t h1c_recovery_probe_inhibit_total = 0;
@@ -18562,6 +18711,24 @@ struct ZeroFGIndependentPresenter::Impl {
   uint64_t split_present_spacing_push_total = 0;
   uint64_t split_present_spacing_push_max_ns = 0;
   uint64_t split_preaccept_capacity_gate_total = 0;
+  // The presentation advance (ObservePresentationAdvance), always on in
+  // the release line.
+  static constexpr bool kPresentationAdvanceEnabled = true;
+  static constexpr uint64_t kPresentationAdvanceEvery = 4;
+  static constexpr uint64_t kPresentationAdvanceMaxNs = 250000000ull;
+  static constexpr uint32_t kPresentationAdvanceRiseStreak = 4;
+  static constexpr uint32_t kPresentationAdvanceLateStreak = 2;
+  uint64_t presentation_advance_ns = 0;
+  uint64_t presentation_advance_outputs_since = 0;
+  uint32_t presentation_advance_up_streak = 0;
+  uint32_t presentation_advance_late_streak = 0;
+  uint32_t presentation_advance_below_streak = 0;
+  uint64_t presentation_advance_gate_seen = 0;
+  uint64_t presentation_advance_capacity_down = 0;
+  uint64_t presentation_advance_steps_up = 0;
+  uint64_t presentation_advance_steps_down = 0;
+  uint64_t presentation_advance_max_ns = 0;
+  uint64_t presentation_advance_excess_max_ns = 0;
   uint64_t split_preadmission_total = 0;
   uint64_t split_preadmission_gate_deferred_total = 0;
   uint64_t split_preadmission_other_deferred_total = 0;

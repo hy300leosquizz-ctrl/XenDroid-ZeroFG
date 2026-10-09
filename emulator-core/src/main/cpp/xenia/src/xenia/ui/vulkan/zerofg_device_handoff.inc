@@ -301,6 +301,7 @@ void ZeroFGDeviceHandoff::Log() {
       "reuse_before_release={} replaced_unaccepted={} acquire_deferred={} "
       "source_bp_waits/ms={}/{} "
       "source_bp_ms slot/depth/mutex={}/{}/{} mutex_waits={} "
+      "source_gpu_depth_wait_ms={} "
       "source_pool_mutex_attempts/contended/attributed_ms={}/{}/{} "
       "A_prepare_us_p50/p90/max={}/{}/{} "
       "A_queue_us_p50/p90/max={}/{}/{} "
@@ -319,6 +320,7 @@ void ZeroFGDeviceHandoff::Log() {
       source_bp_depth_wait_ns_.load(std::memory_order_relaxed) / 1000000,
       source_bp_mutex_wait_ns_.load(std::memory_order_relaxed) / 1000000,
       source_bp_mutex_waits_.load(std::memory_order_relaxed),
+      source_gpu_depth_wait_ns_.load(std::memory_order_relaxed) / 1000000,
       source_mutex_attempts, source_mutex_contended,
       source_mutex_attributed_ns / 1000000,
       source_prepare.Quantile(50) / 1000,
@@ -1156,15 +1158,35 @@ bool ZeroFGDeviceHandoff::Publish(
   while (armed_.load(std::memory_order_acquire) && !failed() && pool_ &&
          consumer && consumer->accepting()) {
     bool head_pending = false;
+    int head_done_fd = -1;
     for (const auto& slot : pool_->slots) {
-      head_pending |= slot.state == Pool::State::kPublished;
+      if (slot.state == Pool::State::kPublished) {
+        head_pending = true;
+        head_done_fd = slot.source_done_fd;
+      }
     }
     if (!head_pending) break;
+    // B defers the head until its copy has finished on A (Acquire never puts
+    // a pending cross-device dependency on B's queue). While that copy is
+    // still running, the Source is waiting for its own GPU, the game's frame
+    // and anything contending with it, not for ZeroFG: that time is the
+    // Source's cadence and is never backpressure. Counting it censored every
+    // P sample of a GPU-bound game (2026-10-08, Halo 3 hot: 46 ms a frame,
+    // 4919 censored, P frozen at 30 fps while the game ran 20-25), and the
+    // lattice then ran ahead of the content, R and S out back to back. Only a
+    // finished head that B has not taken yet is ZeroFG's backpressure. The fd
+    // is read under the pool lock that Acquire takes before it closes it.
+    const bool head_copy_done = HandoffReady(head_done_fd) == 1;
     const uint64_t wait_begin_ns = HandoffNowNs();
     publish_cv_.wait_for(lock, std::chrono::milliseconds(1));
-    source_bp_depth_wait_ns_.fetch_add(HandoffNowNs() - wait_begin_ns,
-                                       std::memory_order_relaxed);
-    AddSourceBackpressureWait(HandoffNowNs() - wait_begin_ns);
+    const uint64_t waited_ns = HandoffNowNs() - wait_begin_ns;
+    if (head_copy_done) {
+      source_bp_depth_wait_ns_.fetch_add(waited_ns, std::memory_order_relaxed);
+      AddSourceBackpressureWait(waited_ns);
+    } else {
+      source_gpu_depth_wait_ns_.fetch_add(waited_ns,
+                                          std::memory_order_relaxed);
+    }
   }
   if (publication_slot_ == UINT32_MAX || mailbox != source_mailbox_ || !pool_)
     return false;

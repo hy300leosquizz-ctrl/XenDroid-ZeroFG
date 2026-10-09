@@ -86,6 +86,39 @@ VkExtent2D ComputeL0Extent(uint32_t width, uint32_t height) {
   return landscape ? VkExtent2D{kPyramidSide, fitted} : VkExtent2D{fitted, kPyramidSide};
 }
 
+// The cells tile a width x height extent: whole cells, and the 4 x 4 lattice of D0a inside each one (exact at any such extent).
+bool CellsTile(uint32_t width, uint32_t height) {
+  const VkExtent2D l0 = ComputeL0Extent(width, height);
+  if (width % l0.width != 0 || height % l0.height != 0) {
+    return false;
+  }
+  const uint32_t cell_w = width / l0.width, cell_h = height / l0.height;
+  const uint32_t stride = (cell_w + uint32_t(kSamples) - 1) / uint32_t(kSamples);
+  return 1 + stride * uint32_t(kSamples - 1) < cell_w && 1 + stride * uint32_t(kSamples - 1) < cell_h;
+}
+
+// The extent RC3 runs a picture at: the picture itself when the cells tile it, otherwise the smallest larger extent they tile (Halo 3's 1152 x 640
+// runs at 1152 x 648). False when none is within reach.
+bool TiledExtent(uint32_t width, uint32_t height, uint32_t* tiled_width, uint32_t* tiled_height) {
+  constexpr uint32_t kReach = 128;  // a whole cell more than the widest cell on either axis
+  uint64_t best_area = std::numeric_limits<uint64_t>::max();
+  for (uint32_t h = height; h < height + kReach && h <= 16384; ++h) {
+    for (uint32_t w = width; w < width + kReach && w <= 16384; ++w) {
+      const uint64_t area = uint64_t(w) * h;
+      if (area >= best_area) {
+        break;
+      }
+      if (CellsTile(w, h)) {
+        best_area = area;
+        *tiled_width = w;
+        *tiled_height = h;
+        break;
+      }
+    }
+  }
+  return best_area != std::numeric_limits<uint64_t>::max();
+}
+
 ActiveRect ResolveRect(const Image& image) {
   if (image.active_rect.width == 0 || image.active_rect.height == 0) {
     return {0, 0, image.width, image.height};
@@ -149,17 +182,19 @@ class Rc3Context final : public AlgorithmContext {
     if (!direct && !HasOptimalFeatures(output_format, VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
       return Status::kUnsupported;
     }
-    // The cells must tile the picture and the 4 x 4 lattice must stay inside its cell (the lattice of D0a, exact at any such resolution): any
-    // other size would run a weaker mode, so it is refused and the host keeps what it had.
-    const VkExtent2D l0 = ComputeL0Extent(width, height);
-    if (width % l0.width != 0 || height % l0.height != 0) {
+    // The cells must tile the extent the engine runs at and the 4 x 4 lattice must stay inside its cell (CellsTile). A picture they do not tile
+    // runs padded: the crop repeats its last column and row into the pad, the engine runs on the padded copy, and only the picture is written out
+    // (through the internal image and the blit). A tiled picture runs exactly as before.
+    uint32_t tiled_w = 0, tiled_h = 0;
+    if (!TiledExtent(width, height, &tiled_w, &tiled_h)) {
       return Status::kUnsupported;
     }
-    const uint32_t cell_w = width / l0.width, cell_h = height / l0.height;
-    const uint32_t stride = (cell_w + uint32_t(kSamples) - 1) / uint32_t(kSamples);
-    if (1 + stride * uint32_t(kSamples - 1) >= cell_w || 1 + stride * uint32_t(kSamples - 1) >= cell_h) {
-      return Status::kUnsupported;
+    const bool padded = tiled_w != width || tiled_h != height;
+    if (padded && (input_format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+                   !HasOptimalFeatures(output_format, VK_FORMAT_FEATURE_BLIT_DST_BIT))) {
+      return Status::kUnsupported;  // the crop copies A2B10G10R10 only, and the picture leaves through a blit
     }
+    const VkExtent2D l0 = ComputeL0Extent(tiled_w, tiled_h);
 
     DestroyWorking();
     ResolveForms(input_format);
@@ -169,11 +204,13 @@ class Rc3Context final : public AlgorithmContext {
     l1_h_ = l0.height / 2;
     l2_w_ = l0.width / 4;
     l2_h_ = l0.height / 4;
-    width_ = width;
-    height_ = height;
+    width_ = tiled_w;
+    height_ = tiled_h;
+    picture_w_ = width;
+    picture_h_ = height;
     input_format_ = input_format;
     output_format_ = output_format;
-    direct_output_ = direct;
+    direct_output_ = direct && !padded;
 
     Status status = CreateWorkingResources();
     if (status == Status::kSuccess) {
@@ -197,7 +234,7 @@ class Rc3Context final : public AlgorithmContext {
     if (!initialized_ || command_buffer == VK_NULL_HANDLE || previous.image == VK_NULL_HANDLE ||
         previous.view == VK_NULL_HANDLE || current.image == VK_NULL_HANDLE ||
         current.view == VK_NULL_HANDLE || output.image == VK_NULL_HANDLE ||
-        output.view == VK_NULL_HANDLE || output.width != width_ || output.height != height_ ||
+        output.view == VK_NULL_HANDLE || output.width != picture_w_ || output.height != picture_h_ ||
         previous.width == 0 || previous.height == 0 || current.width != previous.width ||
         current.height != previous.height || previous.format != input_format_ ||
         current.format != input_format_ || output.format != output_format_ ||
@@ -211,16 +248,17 @@ class Rc3Context final : public AlgorithmContext {
     if (std::abs(phase - 0.5f) > 0.0001f) {
       return Status::kUnsupported;
     }
-    // The active rectangle is the picture (it is what Resize was called with); a physical image larger than it, or a rectangle that does not start at
-    // (0, 0), is cropped into a tight copy first.
+    // The active rectangle is the picture (it is what Resize was called with); a physical image larger than it, a rectangle that does not start at
+    // (0, 0), or a picture that runs padded, is cropped into a tight copy first.
     const ActiveRect rect = ResolveRect(previous), current_rect = ResolveRect(current);
-    if (rect.width != width_ || rect.height != height_ || current_rect.x != rect.x || current_rect.y != rect.y ||
+    if (rect.width != picture_w_ || rect.height != picture_h_ || current_rect.x != rect.x || current_rect.y != rect.y ||
         current_rect.width != rect.width || current_rect.height != rect.height ||
         rect.x > previous.width || rect.y > previous.height || rect.width > previous.width - rect.x ||
         rect.height > previous.height - rect.y) {
       return Status::kInvalidArgument;
     }
-    const bool crop = rect.x != 0 || rect.y != 0 || previous.width != width_ || previous.height != height_;
+    const bool crop = width_ != picture_w_ || height_ != picture_h_ || rect.x != 0 || rect.y != 0 ||
+                      previous.width != picture_w_ || previous.height != picture_h_;
     if (crop) {
       if (input_format_ != VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
         return Status::kUnsupported;
@@ -556,7 +594,7 @@ class Rc3Context final : public AlgorithmContext {
     const size_t d5_bytes = half_resolve_ ? sizeof(zerofg_rc3_d5ah_spv) : sizeof(zerofg_rc3_d5a_spv);
     const bool ok =
         MakePass(&passes_[uint32_t(Stage::kCrop)], zerofg_rc3_crop_spv, sizeof(zerofg_rc3_crop_spv),
-                 {kSampler, kImage}, 16, {}, 2) &&
+                 {kSampler, kImage}, 24, {}, 2) &&
         MakePass(&passes_[uint32_t(Stage::kD0p)], zerofg_rc3_d0p_spv, sizeof(zerofg_rc3_d0p_spv),
                  {kSampler, kSampler, kBuffer, kBuffer}, 20, d0p, 1) &&
         MakePass(&passes_[uint32_t(Stage::kD0)], zerofg_rc3_d0_spv, sizeof(zerofg_rc3_d0_spv),
@@ -779,7 +817,8 @@ class Rc3Context final : public AlgorithmContext {
     dispatch_.cmd_dispatch(cmd, gx, gy, 1);
   }
 
-  // The tight copies of A and B, allocated the first time a physical image larger than the picture arrives (never when the host hands exact images).
+  // The tight copies of A and B, allocated the first time a physical image larger than the picture arrives or a padded picture runs (never when the
+  // host hands exact images of a tiled picture).
   Status EnsureCropImages() {
     if (tight_[0].image() != VK_NULL_HANDLE) {
       return Status::kSuccess;
@@ -804,9 +843,11 @@ class Rc3Context final : public AlgorithmContext {
   void RecordCrop(VkCommandBuffer cmd, const ActiveRect& rect) {
     const VkPipelineStageFlags2 kCompute = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     struct CropPush {
-      int32_t origin[2], extent[2];
-    } push{{int32_t(rect.x), int32_t(rect.y)}, {int32_t(width_), int32_t(height_)}};
-    static_assert(sizeof(CropPush) == 16);
+      int32_t origin[2], extent[2], picture[2];
+    } push{{int32_t(rect.x), int32_t(rect.y)},
+           {int32_t(width_), int32_t(height_)},
+           {int32_t(picture_w_), int32_t(picture_h_)}};
+    static_assert(sizeof(CropPush) == 24);
     for (uint32_t s = 0; s < 2; ++s) {
       ImageBarrier(cmd, tight_[s].image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, kCompute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
@@ -1058,10 +1099,11 @@ class Rc3Context final : public AlgorithmContext {
       VkImageBlit blit{};
       blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
       blit.srcSubresource.layerCount = 1;
-      blit.srcOffsets[1] = {int32_t(width_), int32_t(height_), 1};
+      // Only the picture leaves: a padded run's pad stays in the internal image.
+      blit.srcOffsets[1] = {int32_t(picture_w_), int32_t(picture_h_), 1};
       blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
       blit.dstSubresource.layerCount = 1;
-      blit.dstOffsets[1] = {int32_t(width_), int32_t(height_), 1};
+      blit.dstOffsets[1] = {int32_t(picture_w_), int32_t(picture_h_), 1};
       dispatch_.cmd_blit_image(cmd, fallback_output_.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, output.image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
       ImageBarrier(cmd, output.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, output.layout,
@@ -1120,7 +1162,8 @@ class Rc3Context final : public AlgorithmContext {
   bool direct_output_ = false;
   int precision_ = 32;
   int sharp_ = 1;
-  uint32_t width_ = 0, height_ = 0;
+  uint32_t width_ = 0, height_ = 0;            // the extent the engine runs at (the picture, or the padded extent the cells tile)
+  uint32_t picture_w_ = 0, picture_h_ = 0;     // the picture Resize was called with: what the host hands and receives
   uint32_t l0_w_ = 0, l0_h_ = 0, l1_w_ = 0, l1_h_ = 0, l2_w_ = 0, l2_h_ = 0;
   VkFormat input_format_ = VK_FORMAT_UNDEFINED;
   VkFormat output_format_ = VK_FORMAT_UNDEFINED;

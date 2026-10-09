@@ -280,6 +280,8 @@ class ZeroFGMainSurfaceEgress {
 
   enum class EnqueueResult { kQueued, kNotProducing, kFull };
   bool HasCapacity() const;
+  // The panel's current refresh period as last observed (0: not yet known).
+  uint64_t RefreshCycleNs() const;
   // Refuses while B does not produce (no swapchain yet, or handing back):
   // presentation is closed then, which is not ring pressure.
   EnqueueResult TryEnqueue(const Request& request);

@@ -102,6 +102,9 @@ class ZeroFGDeviceHandoff {
   std::atomic<uint64_t> source_pool_mutex_attributed_wait_ns_{0};
   std::atomic<uint64_t> source_bp_slot_wait_ns_{0};
   std::atomic<uint64_t> source_bp_depth_wait_ns_{0};
+  // The depth wait while the published head's copy was still running on A:
+  // the Source's own GPU, not backpressure (Publish).
+  std::atomic<uint64_t> source_gpu_depth_wait_ns_{0};
   uint64_t export_failures_ = 0, import_failures_ = 0;
   uint64_t release_failures_ = 0, aba_failures_ = 0;
   uint64_t reuse_before_release_ = 0, replaced_unaccepted_ = 0;

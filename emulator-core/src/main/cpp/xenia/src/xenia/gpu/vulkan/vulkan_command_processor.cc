@@ -376,10 +376,12 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
-  // ZeroFG needs the third guest frame in flight: it is the room the game
-  // keeps ahead of the frames ZeroFG holds to generate between them. Without
-  // ZeroFG, two frames in flight keep the game closer to the screen.
-  frames_in_flight_limit_ = ui::vulkan::IsZeroFGRequested() ? 3u : 2u;
+  // Two guest frames in flight, with ZeroFG too (1.0.1). The third frame was
+  // kept as room for ZeroFG when its work waited behind the game's on the
+  // GPU; with device B at KGSL priority that room only queued a frame more of
+  // latency, and under ZeroFG stalls it let the period lock at 20 fps
+  // (2026-10-08 DEV runs: 37-90 ms on two against 80-540 ms on three).
+  frames_in_flight_limit_ = 2u;
   XELOGI("VulkanCommandProcessor: guest frames in flight limit = {}",
          frames_in_flight_limit_);
 

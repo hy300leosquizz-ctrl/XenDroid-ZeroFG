@@ -140,14 +140,36 @@ ZeroFG 1.0 is ready to use, and it has real limits:
   Other GPUs and drivers have not been tested by us yet.
 - **Displays.** It shines with 60 fps games on 120 Hz screens.
 
+## What's new in 1.0.1
+
+- **Lower latency.** ZeroFG's delay could get stuck several frames deeper than
+  it needs and only came back when the game itself stuttered: in Halo 3, 85-175
+  ms from the game's frame to the screen on 1.0. 1.0.1 keeps two game frames in
+  flight instead of three, and drops an old pacing rule (the "physical operating
+  point") that, after a few hiccups, could lock the output at 40 fps with half
+  a second of delay. Halo 3 at 30 fps now measures about 65-80 ms.
+- **A steadier cadence below 30 fps.** ZeroFG took the game waiting for its own
+  GPU for ZeroFG's backpressure, so it ignored the game's real frame rate and
+  kept a 30 fps rhythm, and frames came out in pairs. It now follows the game's
+  real rate.
+- **Halo 3 gets frame generation.** ZeroFG refused pictures its motion grid
+  does not divide evenly (Halo 3 renders at 1152 x 640); it now pads them
+  invisibly and runs.
+- **No frozen screen when ZeroFG stops.** When ZeroFG had to stop in the middle
+  of a game, as it did in Halo 3, the screen could freeze on its last frame
+  while the game kept running. It now hands the screen back.
+- **Protection against a Qualcomm driver crash** (below).
+
 ## Tips and known issues
 
 - **Use a Turnip driver.** Settings → Vulkan → Custom Vulkan driver. ZeroFG
   was validated with Turnip, and its GPU priority works best there.
-- **Known crash with Qualcomm's own driver.** On some phones (seen on an
-  Adreno 830), the phone's own Qualcomm driver crashes while compiling ZeroFG's
-  shaders, about two seconds into the game, when the first generated frame is
-  made. Use Turnip, or turn ZeroFG off on that phone. A fix is planned.
+- **Qualcomm's own driver.** On some phones (seen on an Adreno 830), the
+  phone's own Qualcomm driver crashes while compiling ZeroFG's shaders, about
+  two seconds into the game. Since 1.0.1 the app remembers it: after such a
+  crash the next launch uses ZeroFG's simplest shaders, and after a second one
+  ZeroFG turns itself off for that driver, so the game keeps running. A new
+  driver or a new app version tries again. Turnip avoids it altogether.
 - **Let the phone run at full speed.** Turn on the phone's game or performance
   mode and add XenDroid-ZeroFG to it. Many phones otherwise hold the CPU at
   half speed, and the emulator, which leans on the CPU, falls below 30 fps.
