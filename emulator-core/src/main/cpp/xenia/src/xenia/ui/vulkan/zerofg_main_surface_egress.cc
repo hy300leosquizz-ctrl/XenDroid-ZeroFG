@@ -164,7 +164,7 @@ ZeroFGMainSurfaceEgress::ZeroFGMainSurfaceEgress(
     VulkanDevice* device, ZeroFGMainSurfaceProducer* producer,
     VkSurfaceKHR surface, VkExtent2D extent, VkFormat format,
     uint32_t slot_count, bool elevated_priority, bool apocalypse_guard,
-    bool free_output, bool vsync_quantizer,
+    bool free_output, bool vsync_quantizer, bool vsync_tight_reach,
     std::function<void()> wake_owner)
     : device_(device),
       producer_(producer),
@@ -180,11 +180,13 @@ ZeroFGMainSurfaceEgress::ZeroFGMainSurfaceEgress(
                         nullptr),
       apocalypse_guard_(apocalypse_guard && timing_available_),
       free_output_(free_output),
-      vsync_quantizer_(vsync_quantizer && timing_available_) {
+      vsync_quantizer_(vsync_quantizer && timing_available_),
+      tight_reach_(vsync_tight_reach) {
   counters_.timing_available = timing_available_;
   counters_.apocalypse_guard = apocalypse_guard_;
   counters_.free_output = free_output_;
   counters_.vsync_quantizer = vsync_quantizer_;
+  counters_.vsync_tight_reach = vsync_tight_reach;
   counters_.queue_index = queue_index_;
 }
 
@@ -1005,6 +1007,7 @@ bool ZeroFGMainSurfaceEgress::ServeRequest(const Request& request,
         apocalypse_guard_ ? ShapeDesiredPresent(request, EgressMonotonicTimeNs())
                           : request.desired_present_ns;
     context.assigned_vsync_ns = 0;
+    last_quantize_tight_only_ = false;
     if (vsync_quantizer_) {
       present_time.desiredPresentTime =
           QuantizeToVsync(present_time.desiredPresentTime,
@@ -1066,6 +1069,7 @@ bool ZeroFGMainSurfaceEgress::ServeRequest(const Request& request,
     record.present_ns = present_ns;
     record.ready_ns = 0;
     record.assigned_vsync_ns = context.assigned_vsync_ns;
+    record.tight_only = last_quantize_tight_only_;
     if (request.desired_present_ns) {
       present_call_vs_desired_ns_.Add(BiasSigned(
           int64_t(present_call_ns) - int64_t(request.desired_present_ns)));
@@ -1514,13 +1518,16 @@ uint64_t ZeroFGMainSurfaceEgress::QuantizeToVsync(uint64_t target_ns,
                                                  uint64_t now_ns,
                                                  uint64_t& assigned_ns) {
   assigned_ns = 0;
+  last_quantize_tight_only_ = false;
   uint64_t period_ns = 0;
   uint64_t copy_ns = 0;
+  uint64_t copy_tail_ns = 0;
   {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     period_ns = counters_.refresh_cycle_now_ns;
     if (copy_residence_ns_.count()) {
       copy_ns = copy_residence_ns_.Quantile(50, 100);
+      copy_tail_ns = copy_residence_ns_.Quantile(90, 100);
     }
   }
   if (!period_ns || !vsync_anchor_ns_) {
@@ -1534,9 +1541,26 @@ uint64_t ZeroFGMainSurfaceEgress::QuantizeToVsync(uint64_t target_ns,
     }
     return anchor_ns + (t - anchor_ns + period_ns - 1) / period_ns * period_ns;
   };
-  // The first vsync this output's copy can still make.
-  const uint64_t reach_ns =
+  // The first vsync this output's copy can still make: the copy's median, one
+  // refresh and a margin. zerofg_vsync_tight_reach (optional, off by default)
+  // takes two deadlines instead of their sum: the present queued one refresh
+  // plus 2 ms ahead (the compositor's lead: SF duration 10.33 ms at 120 Hz)
+  // and the copy finished 1.5 ms ahead (an unsignaled latch,
+  // debug.sf.auto_latch_unsignaled=1, holds while our layer updates alone).
+  // It helps only a slow copy (one queue, the copy behind Generation): no
+  // gain was measured on PPSSPP or ARMSX2 (late presents 0-3 %), and in
+  // XenDroid 6-14 % of the presents only it placed came back late. Past
+  // kTightReachLatePermille late among those, the sum comes back for the
+  // session.
+  const bool tight = tight_reach_.load(std::memory_order_relaxed);
+  const uint64_t sum_reach_ns =
       vsync_at_or_after(now_ns + copy_ns + period_ns + kVsyncLatchMarginNs);
+  const uint64_t reach_ns =
+      tight ? vsync_at_or_after(now_ns +
+                                std::max(period_ns + kCompositorLeadExtraNs,
+                                         copy_tail_ns) +
+                                kVsyncLatchMarginNs)
+            : sum_reach_ns;
   uint64_t slot_ns =
       vsync_at_or_after(target_ns) + vsync_offset_periods_ * period_ns;
   bool reanchored = false;
@@ -1572,6 +1596,7 @@ uint64_t ZeroFGMainSurfaceEgress::QuantizeToVsync(uint64_t target_ns,
     return target_ns;
   }
   vsync_last_slot_ns_ = slot_ns;
+  last_quantize_tight_only_ = tight && slot_ns + period_ns / 2 < sum_reach_ns;
   assigned_ns = slot_ns;
   {
     std::lock_guard<std::mutex> lock(stats_mutex_);
@@ -1799,6 +1824,29 @@ void ZeroFGMainSurfaceEgress::MaybePollTimings(bool force) {
       } else {
         ++counters_.vsync_hit;
         hit_queue_before_vsync_ns_.Add(queue_before_ns);
+      }
+      // zerofg_vsync_tight_reach answers only for the presents it placed
+      // earlier than the sum would have: counting every late present switched
+      // it off in the first 30-40 s of a session, at loads (2026-10-17).
+      if (record->tight_only && tight_reach_.load(std::memory_order_relaxed)) {
+        ++counters_.vsync_tight_only;
+        if (late) {
+          ++counters_.vsync_tight_only_late;
+          ++tight_reach_window_late_;
+        }
+        if (++tight_reach_window_presents_ >= kTightReachWindow) {
+          if (tight_reach_window_late_ * 1000 >
+              kTightReachLatePermille * tight_reach_window_presents_) {
+            tight_reach_.store(false, std::memory_order_relaxed);
+            counters_.vsync_tight_reach = false;
+            XELOGI(
+                "ZeroFGMainSurface tight_reach off late={}/{} refresh_us={}",
+                tight_reach_window_late_, tight_reach_window_presents_,
+                counters_.refresh_cycle_now_ns / 1000);
+          }
+          tight_reach_window_presents_ = 0;
+          tight_reach_window_late_ = 0;
+        }
       }
       if (record->ready_ns) {
         const uint64_t ready_before_ns =

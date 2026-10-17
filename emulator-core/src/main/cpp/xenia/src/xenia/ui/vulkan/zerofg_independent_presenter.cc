@@ -855,6 +855,8 @@ struct ZeroFGIndependentPresenter::Impl {
     kFrequencyConfirmation,
     kConfirmedTransition,
     kOther,
+    // A persistent phase lag under the rate lock (ObservePhaseRecovery).
+    kPhaseRecovery,
     kCount,
   };
 
@@ -3109,8 +3111,8 @@ struct ZeroFGIndependentPresenter::Impl {
         // The output shaper (the GPU guard) was tuned for the FIFO egress;
         // with free output and the vsync quantizer its push stacks on the
         // quantizer's lead (35-75 ms, Arkham 2026-10-07), so it stays off.
-        /*apocalypse_guard=*/false, /*free_output=*/true,
-        /*vsync_quantizer=*/true,
+        /*apocalypse_guard=*/false, cvars::zerofg_free_output,
+        cvars::zerofg_vsync_quantizer, cvars::zerofg_vsync_tight_reach,
         [egress_bridge]() { SignalPresenterWake(egress_bridge); });
     const bool egress_started = egress->Start();
     if (egress_started) {
@@ -4583,7 +4585,8 @@ struct ZeroFGIndependentPresenter::Impl {
         "vsync_quantizer={} vsync quantized/reanchor/refused/absorbed="
         "{}/{}/{}/{} ready_before_vsync_us p10/p50/p90={}/{}/{} "
         "vsync hit/late={}/{} hit_min queue/ready_before_vsync_us={}/{} "
-        "late_max queue/ready_before_vsync_us={}/{}",
+        "late_max queue/ready_before_vsync_us={}/{} "
+        "tight_reach={} tight_only/late={}/{}",
         event,
         ZeroFGMainSurfaceProducer::Name(main_surface_producer.state()),
         main_surface_producer.handoff_begin_total(),
@@ -4655,7 +4658,8 @@ struct ZeroFGIndependentPresenter::Impl {
         stats.vsync_late, stats.hit_queue_before_vsync_min_ns / 1000,
         stats.hit_ready_before_vsync_min_ns / 1000,
         stats.late_queue_before_vsync_max_ns / 1000,
-        stats.late_ready_before_vsync_max_ns / 1000);
+        stats.late_ready_before_vsync_max_ns / 1000, stats.vsync_tight_reach,
+        stats.vsync_tight_only, stats.vsync_tight_only_late);
   }
 
   bool TryActivateFromNativeSourceCadence() {
@@ -10362,7 +10366,11 @@ struct ZeroFGIndependentPresenter::Impl {
     const uint64_t own_period_ns =
         rate_lock_own_interval_ns.MeanWithoutExtremes();
     const uint64_t band_ns = stable_output_quantum_ns;
-    if (!own_period_ns || !band_ns || rate_lock_excess_ns <= int64_t(band_ns)) {
+    // While phase recovery has a reference period, its drain owns the
+    // excess: this correction moved the lattice 5-10 % off it, which lost
+    // the trust mid-drain (PPSSPP Naruto, 2026-10-16).
+    if (!own_period_ns || !band_ns || rate_lock_excess_ns <= int64_t(band_ns) ||
+        PhaseRecoveryReferenceNs()) {
       return own_period_ns;
     }
     const uint64_t excess_ns = uint64_t(rate_lock_excess_ns) - band_ns;
@@ -10399,6 +10407,8 @@ struct ZeroFGIndependentPresenter::Impl {
         return "confirmed_transition";
       case SourceReanchorRequestReason::kOther:
         return "other";
+      case SourceReanchorRequestReason::kPhaseRecovery:
+        return "phase_recovery";
       default:
         return "none";
     }
@@ -10634,8 +10644,11 @@ struct ZeroFGIndependentPresenter::Impl {
       return;
     }
 
-    // The period the lattice must follow: the regime P, or the rate lock's.
-    const uint64_t lattice_period_ns = LatticePeriodNs();
+    // The period the lattice must follow: the regime P, or the rate lock's,
+    // or, once phase recovery trusts its window, that window's estimate (one
+    // frequency authority, so the frequency confirmation never reinstalls a
+    // noisier period than the one phase recovery installed).
+    const uint64_t lattice_period_ns = FrequencyAuthorityPeriodNs();
     const uint64_t epoch_pair_period_ns =
         SaturatingMultiplyNs(stable_output_quantum_ns, 2);
     const int64_t period_error_ns =
@@ -10691,6 +10704,11 @@ struct ZeroFGIndependentPresenter::Impl {
       return;
     }
     ++source_phase_stable_source_sample_total;
+
+    if (ObservePhaseRecovery(epoch_pair_period_ns, lattice_period_ns)) {
+      ClearSourcePhaseConfirmation();
+      return;
+    }
 
     // Under the rate lock, a lattice within kRateLockDeadbandPercent of its
     // period is left alone: reanchors were tied to S HOLDs and late outputs
@@ -10780,6 +10798,332 @@ struct ZeroFGIndependentPresenter::Impl {
     }
   }
 
+  // The frequency authority of the Source-phase observer: phase recovery's
+  // window estimate while it is trusted, else LatticePeriodNs(). The rate
+  // lock keeps it while it disagrees with the window by more than 5 % (a
+  // regime change the window has not caught up with yet). Its excess drain
+  // gives way to phase recovery's while the window is trusted: the two
+  // undid each other (RE4 at 30, 2026-10-16).
+  // Phase recovery's reference period: the window estimate while it is
+  // trusted, else the regime estimate while it agrees with the rate lock's own
+  // period within 3 %. Arkham under a 30 fps cap (XenDroid, 2026-10-17)
+  // spread its window estimate over 13-300 us (the 0.3 % gate flipped on and
+  // off) while the regime estimate held 33.34 ms within 20 us; without phase
+  // recovery a pair period 0.8 % short stayed inside the deadband, the
+  // calendar drifted 36 ms every 5 s and S met its Real (1-3 pairs, 38 % of
+  // intervals at two refreshes).
+  uint64_t PhaseRecoveryReferenceNs() const {
+    if (!cvars::zerofg_phase_recovery) {
+      return 0;
+    }
+    if (phase_recovery_trusted_period_ns) {
+      return phase_recovery_trusted_period_ns;
+    }
+    const uint64_t own_ns = rate_lock_own_interval_ns.count()
+                                ? rate_lock_own_interval_ns.MeanWithoutExtremes()
+                                : 0;
+    if (!source_period_ns || !own_ns) {
+      return 0;
+    }
+    const uint64_t gap_ns = source_period_ns > own_ns
+                                ? source_period_ns - own_ns
+                                : own_ns - source_period_ns;
+    return gap_ns * 100 <= own_ns * 3 ? source_period_ns : 0;
+  }
+
+  uint64_t FrequencyAuthorityPeriodNs() {
+    const uint64_t lattice_ns = LatticePeriodNs();
+    const uint64_t trusted_ns = PhaseRecoveryReferenceNs();
+    if (!trusted_ns || !RateLockPeriodNs()) {
+      return lattice_ns;
+    }
+    // A regime change shows in the regime estimate, which moves only on
+    // clusters. The lock's eight intervals swung 13.7-17.1 ms around a
+    // 16.68 ms Source (PPSSPP GoS, its stalls and catch-ups), and each swing
+    // past 5 % handed them the lattice: a reanchor every second.
+    const uint64_t regime_ns = source_period_ns ? source_period_ns : lattice_ns;
+    const uint64_t gap_ns =
+        regime_ns > trusted_ns ? regime_ns - trusted_ns : trusted_ns - regime_ns;
+    if (gap_ns > regime_ns / 20) {
+      return lattice_ns;
+    }
+    ++phase_recovery_authority_trusted_total;
+    return trusted_ns;
+  }
+
+  // Phase recovery. Under the rate lock, the deadband leaves a frequency error
+  // below 3% installed in the calendar, and Phase Debt is off. A Source on its
+  // own clock (not pulled by the host) then drifts the installed targets away
+  // from issue + D without bound: PPSSPP Naruto at 30 fps lost 11-21 ms of
+  // depth per second, down to -1.4 s, with S late at every pair (2026-10-16).
+  //
+  // Coordinated recovery of frequency and phase, through the existing
+  // future-only reanchor (live commitments keep their targets):
+  // - Frequency: the Source's issue times by Source id. Two committed Reals
+  //   half a window apart give one estimate of the Source period; their
+  //   median cancels the issue jitter, and no reanchor (Better D's
+  //   included) enters it. An installed pair period more than 0.3 % away
+  //   from it, held for a few issues, is reinstalled below the deadband.
+  // - Phase: the epoch's committed Reals of the last
+  //   kPhaseRecoveryPhaseWindowNs, both halves at a median depth shallower
+  //   than D (rate_lock_excess_ns < 0; a quantum short at one output per
+  //   refresh), re-place the
+  //   epoch a cushion of max(O / 4, 2 ms) above issue + D, even when the
+  //   period leaves the quantum equal. Any residual frequency error then
+  //   costs a re-placement now and then, not a late S at every pair. Both
+  //   halves deeper than two cushions drain through the rate to one
+  //   (below).
+  // At most one recovery per kPhaseRecoveryCooldownNs, except a drain's end.
+  // Returns true when it requested one.
+  bool ObservePhaseRecovery(uint64_t epoch_pair_period_ns,
+                            uint64_t lattice_period_ns) {
+    const int64_t quantum_ns = int64_t(stable_output_quantum_ns);
+    if (!cvars::zerofg_phase_recovery || !RateLockPeriodNs() || !quantum_ns ||
+        !epoch_pair_period_ns) {
+      phase_recovery_frequency_streak = 0;
+      phase_recovery_drain_ns = 0;
+      phase_recovery_drain_issues_left = 0;
+      return false;
+    }
+    if (source_phase_reanchor_pending) {
+      phase_recovery_frequency_streak = 0;
+      return false;
+    }
+
+    // The Source's own period, every kPhaseRecoveryEstimateIssues: each
+    // sample's issue against the one half a window later, over their Source
+    // id distance. The pairs share no sample, so their median cancels the
+    // issue jitter at the cost of one pass (all pairs of the window: the
+    // same precision at ~100 times the cost). Issue times know no epoch: an
+    // estimate from target - issue had to pair within one, and PPSSPP's
+    // reanchors every 1-5 s left it without pairs most of the time (Naruto,
+    // 2026-10-16: the noisy rate lock then installed O 3.4 % short).
+    if (phase_recovery_estimate_countdown) {
+      --phase_recovery_estimate_countdown;
+    } else {
+      phase_recovery_estimate_countdown = kPhaseRecoveryEstimateIssues - 1;
+      std::array<double, kPhaseRecoveryWindow / 2> estimates;
+      uint32_t pairs = 0;
+      uint64_t source_period_estimate_ns = 0;
+      const uint32_t count = phase_recovery_sample_count;
+      const uint32_t half = count / 2;
+      const uint32_t oldest =
+          (phase_recovery_sample_next + kPhaseRecoveryWindow - count) %
+          kPhaseRecoveryWindow;
+      for (uint32_t k = 0; k + half < count; ++k) {
+        const uint32_t i = (oldest + k) % kPhaseRecoveryWindow;
+        const uint32_t j = (oldest + k + half) % kPhaseRecoveryWindow;
+        const uint64_t id_i = phase_recovery_sample_id[i];
+        const uint64_t id_j = phase_recovery_sample_id[j];
+        const uint64_t issue_i = phase_recovery_sample_issue_ns[i];
+        const uint64_t issue_j = phase_recovery_sample_issue_ns[j];
+        // Long baselines only: the issue jitter divides by the distance.
+        if (id_j <= id_i || id_j - id_i < kPhaseRecoveryMinBaseline ||
+            issue_j <= issue_i) {
+          continue;
+        }
+        estimates[pairs++] =
+            double(issue_j - issue_i) / double(id_j - id_i);
+      }
+      if (pairs >= kPhaseRecoveryMinPairs) {
+        const auto begin = estimates.begin();
+        std::nth_element(begin, begin + pairs / 2, begin + pairs);
+        const double estimate_ns = estimates[pairs / 2];
+        std::nth_element(begin, begin + pairs / 4, begin + pairs / 2);
+        std::nth_element(begin + pairs / 2 + 1, begin + pairs * 3 / 4,
+                         begin + pairs);
+        // A steady Source only: the interquartile range of the long-baseline
+        // estimates within kPhaseRecoveryMaxSpreadPermille of the median. A
+        // Source whose rate wanders (GoW at 60 with dips) keeps the existing
+        // behavior.
+        const double spread_ns = estimates[pairs * 3 / 4] - estimates[pairs / 4];
+        phase_recovery_last_spread_ns = int64_t(spread_ns);
+        const double bound_ns = double(lattice_period_ns) / 20.0;
+        if (estimate_ns > 0.0 &&
+            spread_ns <= estimate_ns * kPhaseRecoveryMaxSpreadPermille / 1000.0 &&
+            std::abs(estimate_ns - double(lattice_period_ns)) <= bound_ns) {
+          source_period_estimate_ns = uint64_t(estimate_ns);
+        }
+      }
+      phase_recovery_last_pairs = pairs;
+      phase_recovery_trusted_period_ns = source_period_estimate_ns;
+    }
+    const uint64_t source_period_estimate_ns = PhaseRecoveryReferenceNs();
+    const uint32_t pairs = phase_recovery_last_pairs;
+    // The pair period phase recovery means to have installed: the Source's,
+    // shortened by the drain while one runs.
+    const uint64_t intended_pair_period_ns =
+        source_period_estimate_ns > uint64_t(phase_recovery_drain_ns)
+            ? source_period_estimate_ns - uint64_t(phase_recovery_drain_ns)
+            : 0;
+    const int64_t frequency_error_ns =
+        intended_pair_period_ns
+            ? int64_t(epoch_pair_period_ns) - int64_t(intended_pair_period_ns)
+            : 0;
+    // 0.3 % on a steady estimate; past it, four times the estimate's spread
+    // (at most 1.5 %): Arkham under a 30 cap moved its estimate 33.2-33.7 ms
+    // when the game turned irregular, and a reinstall chased it every 2 s
+    // (each one a reanchor, 1-3 pairs around them). Smaller errors are a slow
+    // drift the 4 s phase window follows.
+    const int64_t frequency_limit_ns = std::max<int64_t>(
+        int64_t(epoch_pair_period_ns * kPhaseRecoveryFrequencyPermille / 1000),
+        std::min<int64_t>(
+            int64_t(epoch_pair_period_ns * kPhaseRecoveryMaxFrequencyPermille /
+                    1000),
+            4 * phase_recovery_last_spread_ns));
+    const bool frequency_off =
+        (frequency_error_ns < 0 ? -frequency_error_ns : frequency_error_ns) >
+        frequency_limit_ns;
+    phase_recovery_frequency_streak =
+        frequency_off ? phase_recovery_frequency_streak + 1 : 0;
+    // The phase: the excess of the epoch's committed Reals over the last
+    // kPhaseRecoveryPhaseWindowNs, against a cushion of max(O / 4, 2 ms)
+    // above D, where every recovery places the epoch. Both halves of the
+    // window must agree: a Source stall the Source then catches up (PPSSPP
+    // GoS: -30 ms recovered over a few seconds) and Better D's own swings
+    // (its operated D +-5 ms within seconds) are not a phase, and chasing them
+    // re-placed or drained every 2-4 s (2026-10-16).
+    // Better D alone leaves S a few ms of slack (ARMSX2 RE4 at 30: S Post
+    // done p90 2 ms before its target; 5-9 % of S late at zero excess, 0-1 %
+    // at +5 ms). Below zero (the cushion spent), a lag: the old -2 quanta
+    // streak waited 30 s while S went late from -5 ms on (97 % at -13 ms).
+    // Above two cushions, a lead: latency nothing needs, which the rate lock
+    // left in place up to a quantum and more (RE4 at 30: +17 to +27 ms for
+    // minutes). Steady Sources only (a trusted estimate), as for the
+    // frequency.
+    phase_recovery_cushion_ns =
+        uint64_t(std::max<int64_t>(quantum_ns / kPhaseRecoveryLagQuantumDivisor,
+                                   kPhaseRecoveryLagMinimumNs));
+    const int64_t cushion_ns = int64_t(phase_recovery_cushion_ns);
+    int64_t lag_median_ns = 0;
+    int64_t lead_ns = 0;
+    bool lag_due = false;
+    bool lead_due = false;
+    if (source_period_estimate_ns) {
+      const uint32_t window = std::clamp<uint32_t>(
+          uint32_t(kPhaseRecoveryPhaseWindowNs / source_period_estimate_ns),
+          kPhaseRecoveryPhaseMinIssues, kPhaseRecoveryWindow);
+      // Newest first.
+      std::array<int64_t, kPhaseRecoveryWindow> recent;
+      uint32_t recent_count = 0;
+      for (uint32_t k = 0;
+           k < phase_recovery_sample_count && recent_count < window; ++k) {
+        const uint32_t slot =
+            (phase_recovery_sample_next + kPhaseRecoveryWindow - 1 - k) %
+            kPhaseRecoveryWindow;
+        if (phase_recovery_sample_epoch[slot] != semantic_epoch_origin_ns) {
+          break;
+        }
+        recent[recent_count++] = phase_recovery_sample_excess_ns[slot];
+      }
+      if (recent_count == window) {
+        const auto median_of = [&recent](uint32_t from, uint32_t to) {
+          const auto mid = recent.begin() + from + (to - from) / 2;
+          std::nth_element(recent.begin() + from, mid, recent.begin() + to);
+          return *mid;
+        };
+        const int64_t newer_ns = median_of(0, window / 2);
+        const int64_t older_ns = median_of(window / 2, window);
+        lag_median_ns = (newer_ns + older_ns) / 2;
+        // With one output per refresh a shallow calendar presents on
+        // readiness without pairing two outputs on one vsync: PPSSPP GoS at
+        // 60 -> 120 showed 113-121 of 124 at -5..-30 ms, and each
+        // re-placement there added 20-30 ms (2026-10-17). It lags only past
+        // a whole quantum; with two refreshes or more per output (30 -> 60),
+        // from zero.
+        const uint64_t refresh_ns =
+            main_surface_egress ? main_surface_egress->RefreshCycleNs() : 0;
+        const bool one_refresh_quantum =
+            refresh_ns &&
+            stable_output_quantum_ns <= refresh_ns + refresh_ns / 8;
+        const int64_t lag_limit_ns = one_refresh_quantum ? -quantum_ns : 0;
+        lag_due = std::max(newer_ns, older_ns) < lag_limit_ns;
+        lead_ns = std::min(newer_ns, older_ns);
+        lead_due = lead_ns > 2 * cushion_ns;
+      }
+    }
+
+    const bool frequency_due =
+        phase_recovery_frequency_streak >= kPhaseRecoveryFrequencyIssues;
+    const uint64_t now_ns = PresenterMonotonicTimeNs();
+    // A lead drains through the rate, as the rate lock's did: a reanchor
+    // cannot start before the ordered boundary plus a quantum, so the
+    // re-placement that ends a lag keeps a lead. The lattice runs at the
+    // Source's period less a 1/kPhaseRecoveryDrainPairs share of the lead
+    // beyond the cushion (at most kPhaseRecoveryMaxDrainPermille) for
+    // kPhaseRecoveryDrainPairs
+    // issues; then the Source's period comes back, and that reanchor places
+    // the epoch at issue + D if the drain went past it.
+    const char* cause = nullptr;
+    uint64_t period_ns = 0;
+    if (phase_recovery_drain_ns) {
+      if (phase_recovery_drain_issues_left) {
+        --phase_recovery_drain_issues_left;
+      }
+      if (!phase_recovery_drain_issues_left || lag_due ||
+          !source_period_estimate_ns) {
+        // An estimate lost mid-drain (a load) leaves the period the drain
+        // started from, not the rate lock's (15.7 ms for 16.7 in GoW2).
+        cause = lag_due ? "L" : "E";
+        period_ns = source_period_estimate_ns ? source_period_estimate_ns
+                                              : phase_recovery_drain_base_ns;
+        phase_recovery_drain_ns = 0;
+        phase_recovery_drain_issues_left = 0;
+      }
+    } else if (!phase_recovery_last_request_ns ||
+               now_ns - phase_recovery_last_request_ns >=
+                   kPhaseRecoveryCooldownNs) {
+      if (frequency_due || lag_due) {
+        cause = frequency_due ? (lag_due ? "FL" : "F") : "L";
+        period_ns = source_period_estimate_ns ? source_period_estimate_ns
+                                              : lattice_period_ns;
+      } else if (lead_due) {
+        const int64_t max_drain_ns = int64_t(
+            source_period_estimate_ns * kPhaseRecoveryMaxDrainPermille / 1000);
+        phase_recovery_drain_ns = std::min<int64_t>(
+            std::max<int64_t>((lead_ns - cushion_ns) /
+                                  kPhaseRecoveryDrainPairs,
+                              1),
+            max_drain_ns);
+        phase_recovery_drain_issues_left = kPhaseRecoveryDrainPairs;
+        phase_recovery_drain_base_ns = source_period_estimate_ns;
+        cause = "D";
+        period_ns = source_period_estimate_ns - uint64_t(phase_recovery_drain_ns);
+        ++phase_recovery_drain_total;
+      }
+    }
+    if (!cause) {
+      return false;
+    }
+    if (!period_ns) {
+      period_ns = lattice_period_ns;
+    }
+    RequestSourceReanchor(period_ns,
+                          SourceReanchorRequestReason::kPhaseRecovery);
+    ++phase_recovery_request_total;
+    if (frequency_due) {
+      ++phase_recovery_frequency_total;
+    }
+    if (lag_due) {
+      ++phase_recovery_lag_total;
+    }
+    phase_recovery_frequency_streak = 0;
+    phase_recovery_last_request_ns = now_ns;
+    phase_recovery_last_slope_ns = frequency_error_ns;
+    phase_recovery_last_period_ns = period_ns;
+    XELOGI(
+        "ZeroFGPhaseRecovery request={} cause={} excess_us={} "
+        "median_excess_us={} drain_us={} "
+        "pair_period_us old/new={}/{} source_period_estimate_us={} "
+        "lattice_period_us={} pairs={} spread_us={}",
+        phase_recovery_request_total, cause, rate_lock_excess_ns / 1000,
+        lag_median_ns / 1000, phase_recovery_drain_ns / 1000.0,
+        epoch_pair_period_ns / 1000, period_ns / 1000,
+        source_period_estimate_ns / 1000, lattice_period_ns / 1000, pairs,
+        phase_recovery_last_spread_ns / 1000.0);
+    return true;
+  }
+
   bool ApplyPendingSourcePhaseReanchor(uint64_t issue_ns,
                                        uint64_t source_anchor_ns,
                                        uint64_t safe_future_anchor_ns,
@@ -10799,7 +11143,11 @@ struct ZeroFGIndependentPresenter::Impl {
     const uint64_t old_output_quantum_ns = stable_output_quantum_ns;
     const uint64_t new_output_quantum_ns =
         std::max<uint64_t>(requested_source_period_ns / 2, 1);
-    if (new_output_quantum_ns == old_output_quantum_ns) {
+    // A phase recovery re-places the phase even when its period leaves the
+    // quantum where it was.
+    if (new_output_quantum_ns == old_output_quantum_ns &&
+        source_reanchor_provenance.pending !=
+            SourceReanchorRequestReason::kPhaseRecovery) {
       ClearSourcePhaseConfirmation();
       source_phase_reanchor_pending = false;
       pending_source_reanchor_period_ns = 0;
@@ -11050,8 +11398,9 @@ struct ZeroFGIndependentPresenter::Impl {
     const uint64_t pre_reanchor_semantic_target_ns = next_semantic_target_ns;
     if (source_rate_transition_reanchor_pending) {
       // Under the rate lock a confirmed regime transition reforms the lattice
-      // at the lock's period, which it may already follow.
-      const uint64_t lattice_period_ns = LatticePeriodNs();
+      // at the lock's period, which it may already follow, or at phase
+      // recovery's while that one trusts a Source within 5 % of the regime.
+      const uint64_t lattice_period_ns = FrequencyAuthorityPeriodNs();
       RequestSourceReanchor(lattice_period_ns,
                             SourceReanchorRequestReason::kConfirmedTransition);
       if (stable_output_quantum_ns ==
@@ -11084,9 +11433,15 @@ struct ZeroFGIndependentPresenter::Impl {
       ApplyPendingLatencyDepthReanchor(source_id, issue_ns, issue_anchor_ns);
     }
     ObserveSourcePhase(source_id, issue_ns, issue_anchor_ns, forward_skipped_out);
+    // A phase recovery places the epoch its cushion above issue + D.
+    const uint64_t recovery_anchor_ns =
+        source_reanchor_provenance.pending ==
+                SourceReanchorRequestReason::kPhaseRecovery
+            ? SaturatingAddNs(issue_anchor_ns, phase_recovery_cushion_ns)
+            : issue_anchor_ns;
     if (ApplyPendingSourcePhaseReanchor(
             issue_ns, issue_anchor_ns,
-            std::max(issue_anchor_ns, live_anchor_ns), false,
+            std::max(recovery_anchor_ns, live_anchor_ns), false,
             cutover_floor_ns)) {
       ObserveSourceReanchorAnchor(live_anchor_wins);
     }
@@ -15053,6 +15408,22 @@ struct ZeroFGIndependentPresenter::Impl {
       rate_lock_excess_ns = PresenterSignedDeltaNs(
           candidate.target_time_ns,
           SaturatingAddNs(candidate.issue_time_ns, operating_latency_ns));
+      // Phase recovery's samples: the Source's issue by Source id (its
+      // frequency), and the excess by epoch (its phase).
+      if (candidate.source_id) {
+        phase_recovery_sample_id[phase_recovery_sample_next] =
+            candidate.source_id;
+        phase_recovery_sample_issue_ns[phase_recovery_sample_next] =
+            candidate.issue_time_ns;
+        phase_recovery_sample_epoch[phase_recovery_sample_next] =
+            candidate.semantic_epoch_origin_ns;
+        phase_recovery_sample_excess_ns[phase_recovery_sample_next] =
+            rate_lock_excess_ns;
+        phase_recovery_sample_next =
+            (phase_recovery_sample_next + 1) % kPhaseRecoveryWindow;
+        phase_recovery_sample_count =
+            std::min(phase_recovery_sample_count + 1, kPhaseRecoveryWindow);
+      }
     }
     const bool ready_at_commit =
         logical.final_ready_time_ns && now_ns >= logical.final_ready_time_ns;
@@ -17605,12 +17976,25 @@ struct ZeroFGIndependentPresenter::Impl {
   void LogSummary() {
     XELOGI(
         "ZeroFGPacing lattice_P_us={} rate_lock_P_us={} regime_P_us={} O_us={} "
-        "excess_us={} reanchors={} cutover_moved={} guest_pacing_live={}",
+        "excess_us={} reanchors={} cutover_moved={} guest_pacing_live={} "
+        "phase_recovery req/freq/lag/drain={}/{}/{}/{} drain_us={} "
+        "last_freq_error_us={} "
+        "samples/pairs={}/{} spread_us={} reference_us={} trusted_us={} "
+        "authority={} "
+        "phase_error_us={}",
         LatticePeriodNs() / 1000, RateLockPeriodNs() / 1000,
         source_period_ns / 1000, stable_output_quantum_ns / 1000,
         rate_lock_excess_ns / 1000, source_phase_reanchor_total,
         reanchor_cutover_moved_total,
-        ZeroFGGuestPacingLive().load(std::memory_order_relaxed));
+        ZeroFGGuestPacingLive().load(std::memory_order_relaxed),
+        phase_recovery_request_total, phase_recovery_frequency_total,
+        phase_recovery_lag_total, phase_recovery_drain_total,
+        phase_recovery_drain_ns / 1000.0, phase_recovery_last_slope_ns / 1000.0,
+        phase_recovery_sample_count, phase_recovery_last_pairs,
+        phase_recovery_last_spread_ns / 1000.0,
+        PhaseRecoveryReferenceNs() / 1000, phase_recovery_trusted_period_ns / 1000,
+        phase_recovery_authority_trusted_total,
+        source_phase_error_last_ns / 1000);
     XELOGI(
         "ZeroFGPresentationAdvance enabled={} advance_us={} max_us={} "
         "steps_up/down={}/{} capacity_down={} excess_max_us={} refresh_us={}",
@@ -19011,6 +19395,68 @@ struct ZeroFGIndependentPresenter::Impl {
   uint64_t source_phase_stable_source_sample_total = 0;
   bool source_phase_previous_valid = false;
   int64_t source_phase_previous_error_ns = 0;
+  // Phase recovery (ObservePhaseRecovery): the per-period phase drift of the
+  // recent window, the persistence of a lag, the wait after a recovery, and
+  // its telemetry.
+  // 64 samples (2 s at 30) left the estimate 20-45 us off (ARMSX2 RE4): a
+  // drift of up to 1.3 ms/s the 0.3 % gate keeps.
+  static constexpr uint32_t kPhaseRecoveryWindow = 256;
+  // Same-epoch sample pairs before the frequency is trusted, and the
+  // persistence of each condition, in Source issues.
+  static constexpr uint32_t kPhaseRecoveryMinPairs = 48;
+  // Pairs closer than this many Source periods are left out of the estimate.
+  static constexpr uint64_t kPhaseRecoveryMinBaseline = 96;
+  // The estimate is refreshed every this many issues.
+  static constexpr uint32_t kPhaseRecoveryEstimateIssues = 4;
+  uint32_t phase_recovery_estimate_countdown = 0;
+  // The steadiness the Source needs for phase recovery to act: 0.3 % (1 %
+  // with 16-period baselines; the spread falls with the baseline).
+  static constexpr double kPhaseRecoveryMaxSpreadPermille = 3.0;
+  int64_t phase_recovery_last_spread_ns = 0;
+  // The phase is the excess of the epoch's Reals over this long (at least
+  // this many), each half's median on the same side; the cushion is
+  // max(O / 4, 2 ms). 32 and then 128 Reals in one median followed Better
+  // D's own swings and Source stalls: a drain or a re-placement every 2-4 s.
+  static constexpr uint64_t kPhaseRecoveryPhaseWindowNs = 4000000000ull;
+  static constexpr uint32_t kPhaseRecoveryPhaseMinIssues = 64;
+  static constexpr int64_t kPhaseRecoveryLagQuantumDivisor = 4;
+  static constexpr int64_t kPhaseRecoveryLagMinimumNs = 2000000;
+  static constexpr uint32_t kPhaseRecoveryFrequencyIssues = 8;
+  // A lead drains over this many issues, at most this share of the period
+  // per pair.
+  static constexpr uint32_t kPhaseRecoveryDrainPairs = 64;
+  static constexpr uint64_t kPhaseRecoveryMaxDrainPermille = 20;
+  int64_t phase_recovery_drain_ns = 0;
+  uint32_t phase_recovery_drain_issues_left = 0;
+  uint64_t phase_recovery_drain_base_ns = 0;
+  // Where a phase recovery places the epoch above issue + D.
+  uint64_t phase_recovery_cushion_ns = 0;
+  uint64_t phase_recovery_drain_total = 0;
+  // A frequency error the lattice may keep: 0.3 % of the pair period.
+  static constexpr uint64_t kPhaseRecoveryFrequencyPermille = 3;
+  // ... and at most this much on a noisy estimate (four times its spread).
+  static constexpr uint64_t kPhaseRecoveryMaxFrequencyPermille = 15;
+  // The least time between two recoveries.
+  static constexpr uint64_t kPhaseRecoveryCooldownNs = 2000000000ull;
+  std::array<uint64_t, kPhaseRecoveryWindow> phase_recovery_sample_id = {};
+  std::array<uint64_t, kPhaseRecoveryWindow> phase_recovery_sample_issue_ns =
+      {};
+  std::array<uint64_t, kPhaseRecoveryWindow> phase_recovery_sample_epoch = {};
+  std::array<int64_t, kPhaseRecoveryWindow> phase_recovery_sample_excess_ns =
+      {};
+  uint32_t phase_recovery_sample_count = 0;
+  uint32_t phase_recovery_sample_next = 0;
+  uint32_t phase_recovery_frequency_streak = 0;
+  uint64_t phase_recovery_last_request_ns = 0;
+  uint32_t phase_recovery_last_pairs = 0;
+  // The window's Source period while it is trusted (0 otherwise).
+  uint64_t phase_recovery_trusted_period_ns = 0;
+  uint64_t phase_recovery_authority_trusted_total = 0;
+  uint64_t phase_recovery_request_total = 0;
+  uint64_t phase_recovery_frequency_total = 0;
+  uint64_t phase_recovery_lag_total = 0;
+  int64_t phase_recovery_last_slope_ns = 0;
+  uint64_t phase_recovery_last_period_ns = 0;
   uint64_t source_phase_confirmation_start_issue_ns = 0;
   int64_t source_phase_confirmation_period_error_ns = 0;
   uint64_t source_phase_confirmation_frequency_accumulated_ns = 0;

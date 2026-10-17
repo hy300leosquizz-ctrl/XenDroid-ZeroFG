@@ -140,6 +140,26 @@ ZeroFG 1.0 is ready to use, and it has real limits:
   Other GPUs and drivers have not been tested by us yet.
 - **Displays.** It shines with 60 fps games on 120 Hz screens.
 
+## What's new in 1.0.4
+
+The app goes from 1.0.2 to 1.0.4 to keep its number with the ZeroFG engine
+(1.0.3 was the engine's release for ARMSX2). The engine is unchanged; this is
+pacing, learned on two other emulators (PPSSPP and ARMSX2) and brought back:
+
+- **The output stays on the game's clock.** A game that keeps its own time
+  (a frame rate cap, a game ZeroFG cannot pull to the vblank) could drift
+  ZeroFG's output schedule away from it. At 30 -> 60 that showed as uneven
+  pairs on screen: a generated frame next to its real one, then a long gap.
+  ZeroFG now measures the game's period from its frame times, brings a
+  schedule that fell behind back to a small cushion, and drains one far ahead
+  through the rate. Nothing is skipped.
+- **Measured** on the Adreno 840: Batman: Arkham City under a 30 fps cap went
+  from 38 % to 79-89 % of its frames on screen evenly at two refreshes each;
+  Rayman Origins stays even. The even pairs cost some of the delay the drifted
+  schedule had hidden: about 70 ms from the game's frame to the screen in that
+  Arkham case, where the uneven pairs measured 52.
+- No new settings: phase recovery is on by default.
+
 ## What's new in 1.0.2
 
 - **The output follows the game's real rhythm.** Many 360 games wait for the

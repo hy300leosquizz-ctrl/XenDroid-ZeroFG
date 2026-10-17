@@ -96,6 +96,32 @@ DEFINE_string(
     "ZeroFG frame generation: off, zero or reallyzero (the economy tier). "
     "Read when a game starts.",
     "Vulkan");
+DEFINE_bool(
+    zerofg_phase_recovery, true,
+    "Keep ZeroFG's output calendar on the game's own clock: the game's period "
+    "is measured from its issue times and reinstalled when the calendar is "
+    "more than 0.3% off, a calendar shallower than the presenter's depth is "
+    "re-placed a small cushion above it, and one far deeper drains through "
+    "the rate. Without it a 30 fps game can drift into uneven 1-3 refresh "
+    "pairs on screen. Default on.",
+    "Vulkan");
+DEFINE_bool(
+    zerofg_free_output, true,
+    "ZeroFG presents its outputs at their own times instead of one per "
+    "display refresh. Startup-only; default on.",
+    "Vulkan");
+DEFINE_bool(
+    zerofg_vsync_quantizer, true,
+    "ZeroFG asks the compositor for the first refresh its output can reach, "
+    "so two outputs never meet in one compositor latch. Startup-only; default "
+    "on.",
+    "Vulkan");
+DEFINE_bool(
+    zerofg_vsync_tight_reach, false,
+    "Optional: let the vsync quantizer aim one refresh closer when the copy "
+    "allows it (switches itself off past 5% late presents). Helps some hosts, "
+    "hurt this one. Startup-only; default off.",
+    "Vulkan");
 #if XE_PLATFORM_MAC
 DEFINE_bool(vulkan_presenter_use_backing_scale, false,
             "Use the macOS view backing scale factor for MoltenVK drawables.",

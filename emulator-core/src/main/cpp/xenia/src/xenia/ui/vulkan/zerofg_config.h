@@ -9,6 +9,12 @@
 DECLARE_bool(zerofg_frame_generation);
 DECLARE_string(zerofg_mode);
 DECLARE_uint32(zerofg_fps_limit);
+// Pacing tools (README.md, "Tuning a host's pacing"): phase recovery, free
+// output and the vsync quantizer default on, the tight reach off.
+DECLARE_bool(zerofg_phase_recovery);
+DECLARE_bool(zerofg_free_output);
+DECLARE_bool(zerofg_vsync_quantizer);
+DECLARE_bool(zerofg_vsync_tight_reach);
 
 namespace xe::ui::vulkan {
 

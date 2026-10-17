@@ -251,6 +251,11 @@ class ZeroFGMainSurfaceEgress {
     // one was (signed): together they bracket the compositor's deadline.
     uint64_t vsync_hit = 0;
     uint64_t vsync_late = 0;
+    // zerofg_vsync_tight_reach: whether it is on (and still holds), and the
+    // timed presents only it placed with those of them that came back late.
+    bool vsync_tight_reach = false;
+    uint64_t vsync_tight_only = 0;
+    uint64_t vsync_tight_only_late = 0;
     int64_t hit_queue_before_vsync_min_ns = 0;
     int64_t hit_ready_before_vsync_min_ns = 0;
     int64_t late_queue_before_vsync_max_ns = 0;
@@ -263,6 +268,7 @@ class ZeroFGMainSurfaceEgress {
                           VkFormat format, uint32_t slot_count,
                           bool elevated_priority, bool apocalypse_guard,
                           bool free_output, bool vsync_quantizer,
+                          bool vsync_tight_reach,
                           std::function<void()> wake_owner);
   ZeroFGMainSurfaceEgress(const ZeroFGMainSurfaceEgress&) = delete;
   ZeroFGMainSurfaceEgress& operator=(const ZeroFGMainSurfaceEgress&) = delete;
@@ -339,6 +345,8 @@ class ZeroFGMainSurfaceEgress {
     uint64_t ready_ns = 0;
     // Vsync quantizer: the vsync its present was given (0: none).
     uint64_t assigned_vsync_ns = 0;
+    // zerofg_vsync_tight_reach: a vsync only the two-deadline reach allowed.
+    bool tight_only = false;
   };
 
   static constexpr size_t kTimingRecordCount = 64;
@@ -391,6 +399,12 @@ class ZeroFGMainSurfaceEgress {
   // SurfaceFlinger starts composing 10.33 ms before V and auto-latches an
   // unsignaled buffer while a single layer updates.
   static constexpr uint64_t kVsyncLatchMarginNs = 1500000ull;
+  // zerofg_vsync_tight_reach: the compositor's lead past one refresh (SF
+  // duration 10.33 ms at 120 Hz); off for the session past this many late
+  // presents per thousand among a window of those only it placed.
+  static constexpr uint64_t kCompositorLeadExtraNs = 2000000ull;
+  static constexpr uint32_t kTightReachWindow = 120;
+  static constexpr uint32_t kTightReachLatePermille = 50;
   // Free output: waits, outside every lock, until the next slot of the
   // learned limiter grid, serving only the newest output that arrives
   // meanwhile; sets probe when this present skips the grid to look for the
@@ -475,6 +489,13 @@ class ZeroFGMainSurfaceEgress {
   // longer be reached advances future-only, and a free earlier vsync sheds it
   // again. Production, ordering and the Source are untouched.
   const bool vsync_quantizer_;
+  // zerofg_vsync_tight_reach (QuantizeToVsync), until its late presents
+  // switch it off; the window toward that, and whether the present
+  // QuantizeToVsync just placed got a slot only the tight reach allowed.
+  std::atomic<bool> tight_reach_;
+  uint32_t tight_reach_window_presents_ = 0;
+  uint32_t tight_reach_window_late_ = 0;
+  bool last_quantize_tight_only_ = false;
 
   // Egress-thread state, touched by the owner only after the join.
   VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
