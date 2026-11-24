@@ -1,4 +1,27 @@
-# XenDroid-ZeroFG
+# XenDroid-ZeroFG (retired)
+
+> **This app is retired. ZeroFG now lives in
+> [Xendroid+](https://github.com/phforner0/Xendroid-Plus).**
+>
+> XenDroid-ZeroFG was ZeroFG's first home, and 1.0.4 is its last release: it
+> stays on the releases page, but it will get no more updates. ZeroFG went on to
+> 1.1 and later, and the newer engine ships inside Xendroid+, an actively
+> developed Xenia fork for Android with ZeroFG in its own settings (Off,
+> ReallyZero, Zero).
+>
+> **Get it from [Xendroid+ releases](https://github.com/phforner0/Xendroid-Plus/releases/latest).**
+> Xendroid+ installs as its own app, so you can keep XenDroid-ZeroFG until you
+> have moved your games and settings over. The in-app updater of
+> XenDroid-ZeroFG now points there too.
+>
+> Thank you to everyone who downloaded it (more than 2,700 downloads of
+> XenDroid-ZeroFG in about two and a half months), tested it on their phones
+> and sent logs. The standalone engine is in the
+> [ZeroFG repository](https://github.com/hy300leosquizz-ctrl/ZeroFG).
+>
+> Everything below is the original 1.0.4 README, kept as a record.
+
+---
 
 > Frame generation for Xbox 360 emulation on Android. **ZeroFG 1.0.**
 
